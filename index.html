@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Insurance Illustration Reader — อ่านเอกสาร Word เปรียบเทียบกราฟ</title>
+<link rel="stylesheet" href="style.css">
+<script src="vendor/chart.umd.js"></script>
+<script src="vendor/mammoth.browser.min.js"></script>
+</head>
+<body>
+<div class="wrap">
+
+  <div class="masthead">
+    <div class="masthead-top">
+      <div class="masthead-title">
+        <h1>Insurance Illustration Reader</h1>
+        <div class="sub">อ่านเอกสาร Word (Summary Illustration) แล้วสร้างกราฟเปรียบเทียบอัตโนมัติ</div>
+      </div>
+      <div class="masthead-right">
+        <div class="fs-seg" id="fontSeg">
+          <button data-fs="1" class="fs-btn active">เล็ก</button>
+          <button data-fs="1.18" class="fs-btn">กลาง</button>
+          <button data-fs="1.38" class="fs-btn">ใหญ่</button>
+        </div>
+        <div class="badge-mode">Universal Mode — แยกจากเครื่องมือ SunJoy vs SunRise</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="layout">
+
+    <div class="sidebar-left">
+      <div class="upload-card-compact slot1">
+        <button class="file-btn" id="pickBtn1">เลือกไฟล์ Word</button>
+        <span class="upload-name" id="fileName1">สินค้าที่ 1: ยังไม่ได้เลือกไฟล์</span>
+        <input type="file" id="fileInput1" accept=".docx">
+      </div>
+      <div class="upload-card-compact slot2">
+        <button class="file-btn" id="pickBtn2">เลือกไฟล์ Word</button>
+        <span class="upload-name" id="fileName2">สินค้าที่ 2: ยังไม่ได้เลือกไฟล์</span>
+        <input type="file" id="fileInput2" accept=".docx">
+      </div>
+      <div class="control-panel">
+        <div class="panel-title">ตัวเลือกการแสดงผล</div>
+        <div class="seg-group">
+          <span class="seg-label">โหมดการแสดงผล</span>
+          <div class="seg" id="viewModeSeg">
+            <button data-view="compare" class="seg-btn active">เปรียบเทียบกราฟ</button>
+            <button data-view="xirr" class="seg-btn">ตาราง + XIRR</button>
+          </div>
+        </div>
+        <div class="seg-group" id="compareControls">
+          <span class="seg-label">มูลค่าที่แสดง</span>
+          <div class="seg" id="metricSeg">
+            <button data-metric="sv" class="seg-btn active">Surrender Value</button>
+            <button data-metric="db" class="seg-btn">Death Benefit</button>
+          </div>
+        </div>
+        <div class="seg-group" id="productFilterGroup">
+          <span class="seg-label">แสดงสินค้า</span>
+          <div class="seg" id="productSeg">
+            <button data-product="all" class="seg-btn active">ทั้งหมด</button>
+            <button data-product="p1" class="seg-btn">สินค้าที่ 1</button>
+            <button data-product="p2" class="seg-btn">สินค้าที่ 2</button>
+          </div>
+        </div>
+        <div class="seg-group" id="xirrProductGroup" style="display:none;">
+          <span class="seg-label">วิเคราะห์สินค้า</span>
+          <div class="seg" id="xirrProductSeg">
+            <button data-xirrproduct="p1" class="seg-btn active">สินค้าที่ 1</button>
+            <button data-xirrproduct="p2" class="seg-btn">สินค้าที่ 2</button>
+          </div>
+        </div>
+        <div class="seg-group">
+          <span class="seg-label">ช่วงเวลาที่แสดงในกราฟ</span>
+          <div class="seg" id="rangeSeg">
+            <button data-range="10" class="seg-btn">10 ปีแรก</button>
+            <button data-range="20" class="seg-btn">20 ปีแรก</button>
+            <button data-range="40" class="seg-btn active">40 ปีแรก</button>
+            <button data-range="all" class="seg-btn">ทั้งหมด (ถึงปีสุดท้าย)</button>
+          </div>
+        </div>
+        <div class="seg-group">
+          <span class="seg-label">สกุลเงิน</span>
+          <div class="seg" id="currencySeg">
+            <button data-ccy="usd" class="seg-btn active">USD</button>
+            <button data-ccy="thb" class="seg-btn">บาท</button>
+          </div>
+          <div class="fx-input" id="fxInputWrap" style="display:none;">
+            <span>1 USD =</span>
+            <input type="number" id="fxRate" value="32.50" step="0.01" min="0.01">
+            <span>บาท</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="chart-card" id="compareView">
+      <div class="chart-hint" id="chartHint" style="display:none;"></div>
+      <div class="xirr-legend-note" id="compareLegendNote" style="display:none;">
+        <span>🚩 <span style="color:#c0392b;font-weight:400;">แดง</span> = Cash Breakeven</span>
+        <span>🚩 <span style="color:#1f7a4d;font-weight:400;">เขียว</span> = Guaranteed Breakeven</span>
+      </div>
+      <div id="chartHolder" style="display:none;"><canvas id="cmp"></canvas></div>
+      <div class="empty-state" id="emptyState">
+        <div class="icon">📄</div>
+        <div class="title">อัปโหลดเอกสาร Word เพื่อเริ่มต้น</div>
+        <div class="desc">เลือกไฟล์ Summary Illustration (.docx) อย่างน้อย 1 ไฟล์จากช่องด้านซ้าย ระบบจะอ่านตาราง Surrender Value / Death Benefit และสร้างกราฟให้อัตโนมัติ รองรับทั้งรูปแบบ Guaranteed/Non-Guaranteed (PAR) และรูปแบบ Account Value/Surrender Value/Death Benefit (UL/IUL)</div>
+      </div>
+    </div>
+
+    <div class="chart-card" id="xirrView" style="display:none;">
+      <div class="xirr-section-label" id="xirrNormalLabel" style="display:none;"><span class="swatch-line"></span>แบบจ่ายทีละปี (ปกติ)</div>
+      <div class="xirr-cards" id="xirrCards"></div>
+      <div class="xirr-section-label prepay" id="xirrPrepayLabel" style="display:none;"><span class="swatch-line"></span>แบบ Prepayment (ชำระเบี้ยล่วงหน้า)</div>
+      <div class="xirr-cards prepay-cards" id="xirrCardsPrepay" style="display:none;"></div>
+      <div class="xirr-legend-note" id="xirrLegendNote" style="display:none;">
+        <span>🚩 <span style="color:#c0392b;font-weight:400;">แดง</span> = Cash Breakeven</span>
+        <span>🚩 <span style="color:#1f7a4d;font-weight:400;">เขียว</span> = Guaranteed Breakeven</span>
+        <span>เส้นทึบ = จ่ายทีละปี (ปกติ) &nbsp;|&nbsp; เส้นประ = Prepayment</span>
+      </div>
+      <div class="chart-hint" id="xirrChartHint">แกน X = สิ้นปีกรมธรรม์ &nbsp;|&nbsp; แกน Y = XIRR (% p.a.)</div>
+      <div id="xirrChartHolder"><canvas id="xirrCanvas"></canvas></div>
+      <div class="empty-state" id="xirrEmptyState">
+        <div class="icon">📈</div>
+        <div class="title">ยังไม่มีข้อมูลสำหรับวิเคราะห์ XIRR</div>
+        <div class="desc">อัปโหลดเอกสารอย่างน้อย 1 ไฟล์ และต้องมีคอลัมน์ "Total Premiums Paid" กับ Surrender Value ในตาราง จึงจะคำนวณ XIRR และจุดคุ้มทุนได้</div>
+      </div>
+    </div>
+
+    <div class="sidebar-right">
+      <div class="legend-panel" id="legendPanel">
+        <div class="panel-title">เส้นกราฟ</div>
+        <div class="panel-sub">คลิกเพื่อซ่อน/แสดงแต่ละเส้น</div>
+        <div id="legendList"><div class="legend-empty">ยังไม่มีข้อมูลให้แสดง</div></div>
+      </div>
+      <div class="legend-panel" id="xirrTablePanel" style="display:none;">
+        <div class="panel-title">ตาราง Surrender Value + XIRR</div>
+        <div class="panel-sub" id="xirrTableSub">&nbsp;</div>
+        <div style="overflow-x:auto;">
+          <table class="xirr-table" id="xirrTable"></table>
+        </div>
+      </div>
+    </div>
+
+  </div>
+
+  <div class="foot" id="footNote">
+    เครื่องมือนี้อ่านตารางจากเอกสาร Word โดยอัตโนมัติด้วยการจับคู่คำสำคัญ (Guaranteed / Non-Guaranteed / Surrender Value / Death Benefit / Account Value ฯลฯ) ผลลัพธ์อาจคลาดเคลื่อนหากรูปแบบเอกสารแตกต่างจากมาตรฐานทั่วไป โปรดตรวจทานตัวเลขกับเอกสารต้นฉบับก่อนนำไปใช้กับลูกค้า เอกสารทั้งหมดถูกประมวลผลในเบราว์เซอร์ของคุณเท่านั้น ไม่มีการอัปโหลดไฟล์ขึ้นเซิร์ฟเวอร์ภายนอก
+    <br>XIRR คำนวณจากกระแสเงินสด: เบี้ยประกันจ่ายเป็นงวดรายปี (อนุมานจากคอลัมน์ Total Premiums Paid) เทียบกับ Surrender Value ที่ได้รับ ณ สิ้นปีกรมธรรม์นั้น ๆ เป็นตัวเลขประมาณการเพื่อการวิเคราะห์เบื้องต้นเท่านั้น
+  </div>
+
+</div>
+
+
+<script src="app.js"></script>
+</body>
+</html>
