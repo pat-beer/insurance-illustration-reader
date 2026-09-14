@@ -614,6 +614,7 @@ function extractPrepaymentInfo(docEl, rawText){
 function detectBasisFromText(text){
   const t = (text || '').toLowerCase();
   if (!t) return null;
+  if (isExcludedIllustrationScenario(t)) return 'scenario';
   if (/illustration\s+summary/.test(t) || (/basic\s+plan/.test(t) && /illustration/.test(t) && t.length < 200)) return 'summary';
   if (/pessimistic|optimistic/.test(t)) return 'sensitivity';
   if (/conservative\s+(basis|scenario)/.test(t)) return 'conservative';
@@ -623,6 +624,51 @@ function detectBasisFromText(text){
 }
 function isSensitivityHeader(text){
   return /pessimistic|optimistic/.test((text || '').toLowerCase());
+}
+/* Premium Holiday (and similarly named what-ifs) reuse the base plan's
+   Guaranteed / Current Assumed column template. They must not merge into
+   the illustrated No-Withdrawal series. */
+function isExcludedIllustrationScenario(text){
+  const t = (text || '').toLowerCase();
+  if (!t) return false;
+  return /premium\s*holiday/.test(t) || /premium\s*vacation/.test(t) || /holiday\s+option/.test(t);
+}
+function isAlternateScenarioBasis(basis){
+  return basis === 'sensitivity' || basis === 'scenario';
+}
+function isBasePlanNotesMarker(text){
+  return /notes\s*\(\s*(iii|ii|i)\s*\)/i.test(text || '');
+}
+/* Walk preceding siblings. Do not stop at Guaranteed / Current Assumed
+   headings — those are repeated inside the holiday cluster. Keep walking
+   through the sibling basis table so the second table in a holiday pair
+   still sees "Premium Holiday Option". Stop if we reach the earlier
+   Notes (I)/(II)/(III) base-plan section. Do not scan forward: the real
+   Current Assumed table often sits immediately before the holiday heading. */
+function tableUnderExcludedScenario(tableEl){
+  if (!tableEl) return false;
+  function scan(startEl, nextFn, hopLimit){
+    let el = startEl;
+    let hops = 0;
+    let largeTables = 0;
+    while (el && hops < hopLimit){
+      hops++;
+      const text = cleanText(el.textContent || '');
+      if (text && text.length < 800 && isExcludedIllustrationScenario(text)) return true;
+      if (el.tagName === 'TABLE'){
+        const cells = el.querySelectorAll('td,th');
+        if (cells.length > 12){
+          largeTables++;
+          if (largeTables >= 3) break;
+        }
+      } else if (text && isBasePlanNotesMarker(text) && !isExcludedIllustrationScenario(text)){
+        break;
+      }
+      el = nextFn(el);
+    }
+    return false;
+  }
+  return scan(tableEl.previousElementSibling, el => el.previousElementSibling, 40);
 }
 function hasPrimaryBasisHeader(text){
   const t = (text || '').toLowerCase();
@@ -715,7 +761,7 @@ function findFlatMetricGroups(colHeaders){
     const db = dbs[i] !== undefined ? dbs[i] : -1;
     const headerBits = [av, sv, db].filter(c => c >= 0).map(c => colHeaders[c]).join(' ');
     const basis = detectBasisFromText(headerBits);
-    if (basis === 'sensitivity') continue;
+    if (isAlternateScenarioBasis(basis)) continue;
     groups.push({ av, sv, db, basis: basis || 'single', headerBits });
   }
   return groups;
@@ -929,7 +975,7 @@ function enrichFlatBaseFromZeroWithdrawal(flatCandidates){
   const byBasis = {};
   Object.keys(flatCandidates || {}).forEach(k => {
     const e = flatCandidates[k];
-    if (!e || e.basis === 'sensitivity' || e.basis === 'summary') return;
+    if (!e || isAlternateScenarioBasis(e.basis) || e.basis === 'summary') return;
     if (!byBasis[e.basis]) byBasis[e.basis] = {};
     byBasis[e.basis][e.hasWithdrawal ? 'wd' : 'base'] = e;
   });
@@ -1000,6 +1046,7 @@ function parseIllustrationHtml(html, rawText){
     const yearCol = 0;
     const distinctYears = countDistinctPolicyYears(dataRows, yearCol);
     const headerBasis = detectBasisFromText(fullHeaderLower);
+    if (tableUnderExcludedScenario(tableEl) || isExcludedIllustrationScenario(fullHeaderLower)) return;
     if (isHonoredSummaryTable(nearBasis, headerBasis, distinctYears) || isSideBySideBasisSummary(colHeaders, dataRows, yearCol)) return;
     if (isSensitivityHeader(fullHeaderLower) && !hasPrimaryBasisHeader(fullHeaderLower)) return;
     function locateAgeCol(headers){
@@ -1081,7 +1128,7 @@ function parseIllustrationHtml(html, rawText){
         if (basis === 'single' && (nearBasis === 'guaranteed' || nearBasis === 'currentAssumed' || nearBasis === 'conservative')){
           basis = nearBasis;
         }
-        if (basis === 'sensitivity' || basis === 'summary') return;
+        if (isAlternateScenarioBasis(basis) || isAlternateScenarioBasis(nearBasis) || basis === 'summary') return;
         if (group.av < 0 && group.sv < 0 && group.db < 0) return;
         const key = basis + '||' + (hasWd ? 'wd' : 'base');
         if (!flatCandidates[key]) flatCandidates[key] = { av: [], sv: [], db: [], wd: [], basis, hasWithdrawal: hasWd };
