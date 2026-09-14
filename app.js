@@ -389,6 +389,48 @@ function mergeRows(rows, valueKeys){
   return merged;
 }
 
+function seriesAgeOffset(series){
+  if (!series || !series.years || !series.ages) return null;
+  for (let i = 0; i < series.years.length; i++){
+    const y = series.years[i], a = series.ages[i];
+    if (y !== null && y !== undefined && a !== null && a !== undefined && !isNaN(y) && !isNaN(a)){
+      return a - y;
+    }
+  }
+  return null;
+}
+function seriesAgesAllMissing(series){
+  if (!series || !series.years || !series.years.length) return false;
+  if (!series.ages || !series.ages.length) return true;
+  return series.ages.every(a => a === null || a === undefined);
+}
+/* Last-resort age fill: only when a series has years but no Age column, no
+   "At age X" rows, and no sibling series on the same product yielded an offset.
+   age = issueAge + year (age-nearest-birthday convention). Never invent an age
+   if issueAge itself is missing. Never overwrite a series that already has ages. */
+function fillMissingSeriesAges(result){
+  const issueAge = result && result.meta ? result.meta.issueAge : null;
+  const all = [result.sv, result.db, result.svWithdrawal, result.dbWithdrawal].filter(Boolean);
+  all.forEach(series => {
+    if (!seriesAgesAllMissing(series)) return;
+    let offset = null;
+    all.forEach(sib => {
+      if (sib === series || offset !== null) return;
+      offset = seriesAgeOffset(sib);
+    });
+    if (offset === null && issueAge !== null && issueAge !== undefined && !isNaN(issueAge)){
+      offset = issueAge;
+    }
+    if (offset === null) return;
+    series.ages = series.years.map((y, i) => {
+      const existing = series.ages && series.ages[i];
+      if (existing !== null && existing !== undefined) return existing;
+      if (y === null || y === undefined) return null;
+      return offset + y;
+    });
+  });
+}
+
 /* ---------- Header signature for continuation-table grouping ---------- */
 function stripZoneWords(text){
   return text
@@ -409,6 +451,13 @@ function extractMetadata(rawText, docEl){
   let m;
   m = rawText.match(/Age (?:Nearest Birthday|Last Birthday)\s*:?\s*(\d+)/i);
   if (m) meta.issueAge = parseInt(m[1], 10);
+  if (meta.issueAge == null){
+    m = rawText.match(/Age\s*\S{0,6}\s*:\s*(\d{1,3})\s*Sex\b/i);
+    if (m){
+      const n = parseInt(m[1], 10);
+      if (n >= 0 && n < 120) meta.issueAge = n;
+    }
+  }
   m = rawText.match(/Total Initial Annual Premium[^:]*:\s*\$?\s*([\d,\.]+)/i);
   if (m) meta.annualPremium = m[1];
   m = rawText.match(/Proposal Summary for\s+([^\n]+)/i);
@@ -1051,6 +1100,7 @@ function parseIllustrationHtml(html, rawText){
   if (!result.dbWithdrawal) result.dbWithdrawal = buildWithdrawalSeries(dbWdRowsRaw, extraDbWdKeys);
   if (result.svWithdrawal) overlayPremiumByYear(result.svWithdrawal, result.sv);
   if (result.dbWithdrawal) overlayPremiumByYear(result.dbWithdrawal, result.sv || result.db);
+  fillMissingSeriesAges(result);
 
   return result;
 }
