@@ -106,6 +106,7 @@ function findGuaranteedCols(colHeaders){
 function findTotalCol(colHeaders, fromIdx, toIdx){
   for (let c = toIdx; c >= fromIdx; c--){
     const lh = (colHeaders[c] || '').toLowerCase();
+    if (lh.includes('aggregated') && lh.includes('withdrawal')) continue;
     if (lh.includes('total')) return c;
   }
   return toIdx;
@@ -521,6 +522,27 @@ function extractPrepaymentInfo(docEl, rawText){
       source: 'chubb'
     };
   }
+
+  // Zurich-style: "Prepaid premium (for 2nd–5th policy year)" plus
+  // "Total amount to be paid" as the actual out-of-pocket prepayment total.
+  function matchUsdAmount(text, pattern){
+    const mm = (text || '').match(pattern);
+    if (!mm) return null;
+    const v = toNumber(mm[1]);
+    return (!isNaN(v) && v >= MIN_PLAUSIBLE) ? v : null;
+  }
+  const zurichTotal = matchUsdAmount(rawText, /Total amount to be paid[^$]{0,60}USD\s*([\d,]+\.?\d*)/i) ||
+    findLabeledValueInTables(docEl, { val: /total amount to be paid/i }).val;
+  const zurichPrepaid = matchUsdAmount(rawText, /Prepaid premium\s*\([^)]{0,80}policy year[^)]*\)[^$]{0,60}USD\s*([\d,]+\.?\d*)/i);
+  const zurichAnnual = matchUsdAmount(rawText, /Total initial annual premium[^$]{0,60}USD\s*([\d,]+\.?\d*)/i);
+  if (zurichTotal !== null && zurichTotal !== undefined && zurichTotal >= MIN_PLAUSIBLE){
+    return {
+      lumpSum: zurichTotal,
+      prepaidAmount: zurichPrepaid,
+      year1Payment: zurichAnnual,
+      source: 'zurich'
+    };
+  }
   return null;
 }
 
@@ -532,9 +554,109 @@ function detectBasisFromText(text){
   const t = (text || '').toLowerCase();
   if (!t) return null;
   if (/illustration\s+summary/.test(t) || (/basic\s+plan/.test(t) && /illustration/.test(t) && t.length < 200)) return 'summary';
+  if (/pessimistic|optimistic/.test(t)) return 'sensitivity';
+  if (/conservative\s+(basis|scenario)/.test(t)) return 'conservative';
   if (/current\s+assumed/.test(t)) return 'currentAssumed';
   if (/guaranteed\s+basis/.test(t)) return 'guaranteed';
   return null;
+}
+function isSensitivityHeader(text){
+  return /pessimistic|optimistic/.test((text || '').toLowerCase());
+}
+function hasPrimaryBasisHeader(text){
+  const t = (text || '').toLowerCase();
+  return /conservative\s+(basis|scenario)/.test(t) || /current\s+assumed/.test(t) || /guaranteed\s+basis/.test(t);
+}
+function findInlineWithdrawalCol(colHeaders){
+  const perYear = findHeaderCol(colHeaders, (t, raw) => {
+    const lh = String(raw || t || '').toLowerCase();
+    if (lh.includes('cumulative') || lh.includes('aggregated')) return false;
+    return /withdrawal for that policy year/.test(lh) ||
+      /amount of withdrawal/.test(lh) || headerHas(t, 'amountofwithdrawalmade') ||
+      (headerHas(t, 'withdrawal') && headerHas(t, 'made'));
+  });
+  if (perYear >= 0) return perYear;
+  return findHeaderCol(colHeaders, (t, raw) => {
+    const lh = String(raw || t || '').toLowerCase();
+    return /aggregated/.test(lh) && /withdrawal/.test(lh);
+  });
+}
+function findAggregatedWithdrawalCol(colHeaders){
+  return findHeaderCol(colHeaders, (t, raw) => {
+    const lh = String(raw || t || '').toLowerCase();
+    if (/aggregated/.test(lh) && /withdrawal/.test(lh)) return true;
+    return headerHas(t, 'cumulative') && headerHas(t, 'withdrawal') &&
+      !headerHas(t, 'surrender') && !t.includes('+');
+  });
+}
+/* GCV^^ / GCV## is Chubb's withdrawal-table abbreviation of Guaranteed Cash Value.
+   Only used after an inline withdrawal column has already been found — never as a
+   global substitute for the word "guaranteed". */
+function isGcvGuaranteedHeader(h){
+  const lh = (h || '').toLowerCase();
+  if (lh.includes('non-guaranteed') || lh.includes('non guaranteed')) return false;
+  if (/sum\s+of\s+gcv/.test(lh) || /gcv\s*\+/.test(lh)) return false;
+  return /\bgcv\b/.test(lh) || /gcv[\^#]+/.test(lh);
+}
+function findGuaranteedColsForInlineWithdrawal(colHeaders){
+  const out = findGuaranteedCols(colHeaders);
+  if (out.length) return out;
+  (colHeaders || []).forEach((h, idx) => {
+    if ((h || '').length > 60) return;
+    if (isGcvGuaranteedHeader(h)) out.push(idx);
+  });
+  return out;
+}
+function attachInlineWithdrawalFields(rows, dataRows, colHeaders, inlineWdCol, yearCol){
+  if (!rows || inlineWdCol < 0) return rows;
+  const cumCol = findAggregatedWithdrawalCol(colHeaders);
+  const notionalCol = findHeaderCol(colHeaders, (t, raw) => {
+    const lh = String(raw || t || '').toLowerCase();
+    return /notional/.test(lh) && !/withdrawal/.test(lh);
+  });
+  const byYear = new Map();
+  (dataRows || []).forEach(r => {
+    const label = cleanText(r[yearCol === undefined ? 0 : yearCol]);
+    if (!/^\d+$/.test(label)) return;
+    const year = parseInt(label, 10);
+    const cash = toNumber(r[inlineWdCol]);
+    const cum = cumCol >= 0 ? toNumber(r[cumCol]) : NaN;
+    const notional = notionalCol >= 0 ? toNumber(r[notionalCol]) : NaN;
+    byYear.set(year, {
+      cashWithdrawal: isNaN(cash) ? 0 : cash,
+      cumulativeWithdrawal: isNaN(cum) ? 0 : cum,
+      notionalAfterWithdrawal: isNaN(notional) ? null : notional
+    });
+  });
+  rows.forEach(row => {
+    const extra = byYear.get(row.year);
+    if (!extra) return;
+    row.cashWithdrawal = extra.cashWithdrawal;
+    row.cumulativeWithdrawal = extra.cumulativeWithdrawal;
+    if (extra.notionalAfterWithdrawal !== null) row.notionalAfterWithdrawal = extra.notionalAfterWithdrawal;
+  });
+  return rows;
+}
+function findFlatMetricGroups(colHeaders){
+  const avs = [], svs = [], dbs = [];
+  (colHeaders || []).forEach((h, idx) => {
+    const lh = (h || '').toLowerCase();
+    if (lh.includes('account value')) avs.push(idx);
+    if (lh.includes('surrender value')) svs.push(idx);
+    if (lh.includes('death benefit')) dbs.push(idx);
+  });
+  const n = Math.max(avs.length, svs.length, dbs.length);
+  const groups = [];
+  for (let i = 0; i < n; i++){
+    const av = avs[i] !== undefined ? avs[i] : -1;
+    const sv = svs[i] !== undefined ? svs[i] : -1;
+    const db = dbs[i] !== undefined ? dbs[i] : -1;
+    const headerBits = [av, sv, db].filter(c => c >= 0).map(c => colHeaders[c]).join(' ');
+    const basis = detectBasisFromText(headerBits);
+    if (basis === 'sensitivity') continue;
+    groups.push({ av, sv, db, basis: basis || 'single', headerBits });
+  }
+  return groups;
 }
 function nearestBasisMarker(tableEl){
   let el = tableEl ? tableEl.previousElementSibling : null;
@@ -564,18 +686,44 @@ function countFlatMetricCols(colHeaders){
   });
   return { av, sv, db };
 }
+function countDistinctPolicyYears(dataRows, yearCol){
+  const col = yearCol === undefined ? 0 : yearCol;
+  const years = (dataRows || []).map(r => parseInt(cleanText(r[col]), 10)).filter(y => y > 0);
+  return new Set(years).size;
+}
 function isSideBySideBasisSummary(colHeaders, dataRows, yearCol){
   const n = countFlatMetricCols(colHeaders);
   if (n.av < 2 || n.sv < 2) return false;
-  const years = (dataRows || []).map(r => parseInt(cleanText(r[yearCol === undefined ? 0 : yearCol]), 10)).filter(y => y > 0);
-  return new Set(years).size < 8;
+  return countDistinctPolicyYears(dataRows, yearCol) < 8;
+}
+/* Heading text like "N. Basic Plan – Illustration Summary" is insurer boilerplate
+   on full annual tables as well as on sparse milestone blurbs. Only treat a table
+   as a skippable summary when the table itself is short. */
+function isHonoredSummaryTable(nearBasis, headerBasis, distinctYears){
+  return (nearBasis === 'summary' || headerBasis === 'summary') && distinctYears < 8;
+}
+/* Prepaid-premium / projected-interest breakdowns sometimes contain the word
+   "guaranteed" in a short column. They are not PAR SV/DB zones. */
+function isPrepaidPremiumInfoTable(fullHeaderLower){
+  const t = fullHeaderLower || '';
+  if (!/prepaid\s*premium|projected\s+interest/.test(t)) return false;
+  return !/surrender\s+value|death\s+benefit|\bgcv\b/.test(t);
+}
+function looksLikeParIllustrationTable(colHeaders, dataRows, yearCol, fullHeaderLower){
+  if (isPrepaidPremiumInfoTable(fullHeaderLower)) return false;
+  if (countDistinctPolicyYears(dataRows, yearCol) >= 8) return true;
+  const metricCols = (colHeaders || []).filter(h => {
+    const lh = (h || '').toLowerCase();
+    return /surrender\s+value|death\s+benefit|guaranteed\s+cash|\bgcv\b|reversionary|terminal\s+bonus/.test(lh);
+  }).length;
+  return metricCols >= 3;
 }
 function extractAssumedCreditingRate(rawText){
   const t = rawText || '';
   const patterns = [
-    /current\s+assumed(?:\s+basis)?[^%]{0,120}?(\d+(?:\.\d+)?)\s*%/i,
-    /assumed\s+crediting(?:\s+interest)?\s+rate[^%]{0,60}?(\d+(?:\.\d+)?)\s*%/i,
-    /crediting\s+interest\s+rate[^%]{0,60}?(\d+(?:\.\d+)?)\s*%/i
+    /crediting\s+interest\s+rate\s+since[^%]{0,80}?(\d+(?:\.\d+)?)\s*%/i,
+    /current\s+assumed(?:\s+basis)?[^%]{0,160}?crediting\s+interest\s+rate[^%]{0,80}?(\d+(?:\.\d+)?)\s*%/i,
+    /assumed\s+crediting(?:\s+interest)?\s+rate[^%]{0,60}?(\d+(?:\.\d+)?)\s*%/i
   ];
   for (let i = 0; i < patterns.length; i++){
     const m = t.match(patterns[i]);
@@ -614,6 +762,59 @@ function buildFlatAxis(entries){
 function seriesFromMap(years, map){
   return years.map(y => map.has(y) ? map.get(y) : null);
 }
+function runningWithdrawalSum(years, wdMap){
+  let run = 0;
+  return years.map(y => {
+    const v = wdMap.has(y) ? wdMap.get(y) : 0;
+    if (v !== null && v !== undefined && !isNaN(v)) run += v;
+    return run;
+  });
+}
+function assembleFlatPair(lowEntry, assumedEntry, lowKind, withWithdrawal){
+  const entries = [lowEntry, assumedEntry].filter(Boolean);
+  const { years, ages } = buildFlatAxis(entries);
+  const assumedSrc = assumedEntry || lowEntry;
+  const avMap = rowsToYearMap(assumedSrc.av, 'value');
+  const svMap = rowsToYearMap(assumedSrc.sv, 'value');
+  const dbMap = rowsToYearMap(assumedSrc.db, 'value');
+  const pSrc = assumedSrc.sv && assumedSrc.sv.length ? assumedSrc.sv
+    : (assumedSrc.av && assumedSrc.av.length ? assumedSrc.av : assumedSrc.db);
+  const pMap = premiumYearMap(pSrc);
+  const sv = {
+    years, ages,
+    accountValue: seriesFromMap(years, avMap),
+    surrenderValue: seriesFromMap(years, svMap),
+    premium: seriesFromMap(years, pMap)
+  };
+  const db = {
+    years, ages,
+    deathBenefit: seriesFromMap(years, dbMap),
+    premium: seriesFromMap(years, pMap)
+  };
+  if (lowEntry && assumedEntry && lowKind){
+    const lAv = rowsToYearMap(lowEntry.av, 'value');
+    const lSv = rowsToYearMap(lowEntry.sv, 'value');
+    const lDb = rowsToYearMap(lowEntry.db, 'value');
+    const aAv = rowsToYearMap(assumedEntry.av, 'value');
+    const aSv = rowsToYearMap(assumedEntry.sv, 'value');
+    const aDb = rowsToYearMap(assumedEntry.db, 'value');
+    sv[lowKind] = { accountValue: seriesFromMap(years, lAv), surrenderValue: seriesFromMap(years, lSv) };
+    sv.currentAssumed = { accountValue: seriesFromMap(years, aAv), surrenderValue: seriesFromMap(years, aSv) };
+    db[lowKind] = { deathBenefit: seriesFromMap(years, lDb) };
+    db.currentAssumed = { deathBenefit: seriesFromMap(years, aDb) };
+  }
+  if (withWithdrawal){
+    const wdSrc = (assumedEntry && assumedEntry.wd && assumedEntry.wd.length) ? assumedEntry.wd
+      : (lowEntry && lowEntry.wd) ? lowEntry.wd : [];
+    const wdMap = rowsToYearMap(wdSrc, 'value');
+    const cash = seriesFromMap(years, wdMap).map(v => (v === null ? 0 : v));
+    sv.cashWithdrawal = cash;
+    db.cashWithdrawal = cash.slice();
+    sv.cumulativeWithdrawal = runningWithdrawalSum(years, wdMap);
+    db.cumulativeWithdrawal = sv.cumulativeWithdrawal.slice();
+  }
+  return { sv, db };
+}
 
 /* ---------- Main parser: given mammoth HTML string, extract SV/DB series ---------- */
 function parseIllustrationHtml(html, rawText){
@@ -636,11 +837,12 @@ function parseIllustrationHtml(html, rawText){
     let colHeaders = columnHeaders(headerRows, maxCols);
     let dataRows = dataRowsRaw;
     const fullHeaderLower = colHeaders.join(' ').toLowerCase();
-    const headerBasis = detectBasisFromText(fullHeaderLower);
     const nearBasis = nearestBasisMarker(tableEl);
-    const tableBasis = headerBasis || nearBasis;
     const yearCol = 0;
-    if (tableBasis === 'summary' || isSideBySideBasisSummary(colHeaders, dataRows, yearCol)) return;
+    const distinctYears = countDistinctPolicyYears(dataRows, yearCol);
+    const headerBasis = detectBasisFromText(fullHeaderLower);
+    if (isHonoredSummaryTable(nearBasis, headerBasis, distinctYears) || isSideBySideBasisSummary(colHeaders, dataRows, yearCol)) return;
+    if (isSensitivityHeader(fullHeaderLower) && !hasPrimaryBasisHeader(fullHeaderLower)) return;
     function locateAgeCol(headers){
       let idx = null;
       headers.forEach((h, i) => {
@@ -650,8 +852,8 @@ function parseIllustrationHtml(html, rawText){
     }
 
     // "… AFTER CASH WITHDRAWAL" is a parallel scenario on the same policy — parse
-    // it separately. Other withdrawal-related tables (e.g. "Illustration Under
-    // Withdrawal Arrangement", cash-withdrawal-amount breakdowns) are still skipped.
+    // it separately. Tables that only mention withdrawal without an inline
+    // per-year / aggregated column (cash-withdrawal-amount breakdowns) are skipped.
     if (isAfterCashWithdrawalHeader(fullHeaderLower)){
       const collapsed = collapseDuplicateHeaderColumns(colHeaders, dataRows);
       colHeaders = collapsed.colHeaders;
@@ -668,56 +870,67 @@ function parseIllustrationHtml(html, rawText){
       bucket[sig].push(...rows);
       return;
     }
-    if (fullHeaderLower.includes('withdrawal')) return; // skip supplementary "under withdrawal arrangement" tables — different scenario, not the base plan
+    const inlineWdCol = findInlineWithdrawalCol(colHeaders);
+    if (fullHeaderLower.includes('withdrawal') && inlineWdCol < 0) return;
 
     const ageColIdx = locateAgeCol(colHeaders);
     const premiumColIdx = findPremiumCol(colHeaders, 0, maxCols - 1);
 
-    const guarCols = findGuaranteedCols(colHeaders);
+    const guarCols = inlineWdCol >= 0
+      ? findGuaranteedColsForInlineWithdrawal(colHeaders)
+      : findGuaranteedCols(colHeaders);
+    const parEligible = guarCols.length >= 1 && looksLikeParIllustrationTable(colHeaders, dataRows, yearCol, fullHeaderLower);
 
-    if (guarCols.length >= 2){
+    if (parEligible && guarCols.length >= 2){
       // Combined table: zone1 = SV (before 2nd guaranteed marker), zone2 = DB (from 2nd marker to end)
       const zone1End = guarCols[1] - 1;
       const zone2End = maxCols - 1;
       const svRows = extractParZone(dataRows, colHeaders, guarCols[0], zone1End, yearCol, ageColIdx, premiumColIdx);
       const dbRows = extractParZone(dataRows, colHeaders, guarCols[1], zone2End, yearCol, ageColIdx, premiumColIdx);
+      if (inlineWdCol >= 0){
+        attachInlineWithdrawalFields(svRows, dataRows, colHeaders, inlineWdCol, yearCol);
+        attachInlineWithdrawalFields(dbRows, dataRows, colHeaders, inlineWdCol, yearCol);
+      }
       const sig1 = headerSignature(colHeaders, [0, zone1End]);
       const sig2 = headerSignature(colHeaders, [guarCols[1], zone2End]);
-      if (!svCandidates[sig1]) svCandidates[sig1] = [];
-      svCandidates[sig1].push(...svRows);
-      if (!dbCandidates[sig2]) dbCandidates[sig2] = [];
-      dbCandidates[sig2].push(...dbRows);
-    } else if (guarCols.length === 1){
+      const svBucket = inlineWdCol >= 0 ? svWithdrawalCandidates : svCandidates;
+      const dbBucket = inlineWdCol >= 0 ? dbWithdrawalCandidates : dbCandidates;
+      if (!svBucket[sig1]) svBucket[sig1] = [];
+      svBucket[sig1].push(...svRows);
+      if (!dbBucket[sig2]) dbBucket[sig2] = [];
+      dbBucket[sig2].push(...dbRows);
+    } else if (parEligible && guarCols.length === 1){
       const zoneEnd = maxCols - 1;
       const rows = extractParZone(dataRows, colHeaders, guarCols[0], zoneEnd, yearCol, ageColIdx, premiumColIdx);
+      if (inlineWdCol >= 0) attachInlineWithdrawalFields(rows, dataRows, colHeaders, inlineWdCol, yearCol);
       const sig = headerSignature(colHeaders, [0, zoneEnd]);
       const isDb = fullHeaderLower.includes('death benefit');
       const isSv = fullHeaderLower.includes('surrender value');
-      if (isDb && !isSv){
-        if (!dbCandidates[sig]) dbCandidates[sig] = [];
-        dbCandidates[sig].push(...rows);
-      } else {
-        if (!svCandidates[sig]) svCandidates[sig] = [];
-        svCandidates[sig].push(...rows);
-      }
+      const bucket = (isDb && !isSv)
+        ? (inlineWdCol >= 0 ? dbWithdrawalCandidates : dbCandidates)
+        : (inlineWdCol >= 0 ? svWithdrawalCandidates : svCandidates);
+      if (!bucket[sig]) bucket[sig] = [];
+      bucket[sig].push(...rows);
     } else {
-      // Possibly a flat UL-style table: Account Value / Surrender Value / Death Benefit as single columns
-      let avCol = -1, svCol = -1, dbCol = -1;
-      colHeaders.forEach((h, idx) => {
-        const lh = h.toLowerCase();
-        if (avCol === -1 && lh.includes('account value')) avCol = idx;
-        if (svCol === -1 && lh.includes('surrender value')) svCol = idx;
-        if (dbCol === -1 && lh.includes('death benefit')) dbCol = idx;
+      // Flat UL-style: Account / Surrender / Death Benefit. Side-by-side dual-basis
+      // tables (Zurich) are split into one candidate per column group, using only
+      // that group's header text for the basis tag — never the whole joined header.
+      const groups = findFlatMetricGroups(colHeaders);
+      const hasWd = inlineWdCol >= 0;
+      groups.forEach(group => {
+        let basis = group.basis;
+        if (basis === 'single' && (nearBasis === 'guaranteed' || nearBasis === 'currentAssumed' || nearBasis === 'conservative')){
+          basis = nearBasis;
+        }
+        if (basis === 'sensitivity' || basis === 'summary') return;
+        if (group.av < 0 && group.sv < 0 && group.db < 0) return;
+        const key = basis + '||' + (hasWd ? 'wd' : 'base');
+        if (!flatCandidates[key]) flatCandidates[key] = { av: [], sv: [], db: [], wd: [], basis, hasWithdrawal: hasWd };
+        if (group.av !== -1) flatCandidates[key].av.push(...extractFlatSeries(dataRows, group.av, yearCol, ageColIdx, premiumColIdx));
+        if (group.sv !== -1) flatCandidates[key].sv.push(...extractFlatSeries(dataRows, group.sv, yearCol, ageColIdx, premiumColIdx));
+        if (group.db !== -1) flatCandidates[key].db.push(...extractFlatSeries(dataRows, group.db, yearCol, ageColIdx, premiumColIdx));
+        if (hasWd) flatCandidates[key].wd.push(...extractFlatSeries(dataRows, inlineWdCol, yearCol, ageColIdx, premiumColIdx));
       });
-      if (svCol !== -1 || dbCol !== -1 || avCol !== -1){
-        const sig = headerSignature(colHeaders, [0, maxCols - 1]);
-        const basis = (tableBasis === 'guaranteed' || tableBasis === 'currentAssumed') ? tableBasis : 'single';
-        const key = basis + '||' + sig;
-        if (!flatCandidates[key]) flatCandidates[key] = { av: [], sv: [], db: [], basis };
-        if (avCol !== -1) flatCandidates[key].av.push(...extractFlatSeries(dataRows, avCol, yearCol, ageColIdx, premiumColIdx));
-        if (svCol !== -1) flatCandidates[key].sv.push(...extractFlatSeries(dataRows, svCol, yearCol, ageColIdx, premiumColIdx));
-        if (dbCol !== -1) flatCandidates[key].db.push(...extractFlatSeries(dataRows, dbCol, yearCol, ageColIdx, premiumColIdx));
-      }
     }
   });
 
@@ -738,25 +951,39 @@ function parseIllustrationHtml(html, rawText){
     });
     return best;
   }
-  function pickBestFlatByBasis(candidates, basis){
+  function pickBestFlatByBasis(candidates, basis, wantWd){
     const subset = {};
     Object.keys(candidates).forEach(k => {
-      if (candidates[k].basis === basis) subset[k] = candidates[k];
+      const e = candidates[k];
+      if (e.basis !== basis) return;
+      if (!!e.hasWithdrawal !== !!wantWd) return;
+      subset[k] = e;
     });
     return pickBestFlat(subset);
+  }
+  function pickPrimaryLow(wantWd){
+    return pickBestFlatByBasis(flatCandidates, 'guaranteed', wantWd) ||
+           pickBestFlatByBasis(flatCandidates, 'conservative', wantWd);
+  }
+  function entryHasValues(entry){
+    return !!(entry && ((entry.sv && entry.sv.length) || (entry.av && entry.av.length)));
   }
 
   const svRowsRaw = pickBest(svCandidates);
   const dbRowsRaw = pickBest(dbCandidates);
   const svWdRowsRaw = pickBest(svWithdrawalCandidates);
   const dbWdRowsRaw = pickBest(dbWithdrawalCandidates);
-  const flatGuaranteed = pickBestFlatByBasis(flatCandidates, 'guaranteed');
-  const flatAssumed = pickBestFlatByBasis(flatCandidates, 'currentAssumed');
-  const flatSingle = pickBestFlatByBasis(flatCandidates, 'single');
-  const isDualFlat = !!(flatGuaranteed && flatAssumed &&
-    (flatGuaranteed.sv.length + flatGuaranteed.av.length) > 0 &&
-    (flatAssumed.sv.length + flatAssumed.av.length) > 0);
-  const flatBest = isDualFlat ? flatAssumed : (flatSingle || flatAssumed || flatGuaranteed);
+  const flatLowBase = pickPrimaryLow(false);
+  const flatAssumedBase = pickBestFlatByBasis(flatCandidates, 'currentAssumed', false);
+  const flatLowWd = pickPrimaryLow(true);
+  const flatAssumedWd = pickBestFlatByBasis(flatCandidates, 'currentAssumed', true);
+  const flatSingle = pickBestFlatByBasis(flatCandidates, 'single', false) || pickBestFlatByBasis(flatCandidates, 'single', true);
+  const dualLowKind = (flatLowBase && flatLowBase.basis) || (flatLowWd && flatLowWd.basis) || null;
+  const isDualFlat = (entryHasValues(flatLowBase) && entryHasValues(flatAssumedBase)) ||
+                     (entryHasValues(flatLowWd) && entryHasValues(flatAssumedWd));
+  const flatBest = isDualFlat
+    ? (flatAssumedBase || flatAssumedWd)
+    : (flatSingle || flatAssumedBase || flatLowBase || flatAssumedWd || flatLowWd);
 
   const meta = extractMetadata(rawText, doc);
   const prepayment = extractPrepaymentInfo(doc, rawText);
@@ -801,47 +1028,27 @@ function parseIllustrationHtml(html, rawText){
     }
   } else if (hasFlat){
     result.type = 'flat';
-    const { years, ages } = buildFlatAxis(isDualFlat ? [flatGuaranteed, flatAssumed] : [flatBest]);
-    const assumedSrc = isDualFlat ? flatAssumed : flatBest;
-    const avMap = rowsToYearMap(assumedSrc.av, 'value');
-    const svMap = rowsToYearMap(assumedSrc.sv, 'value');
-    const dbMap = rowsToYearMap(assumedSrc.db, 'value');
-    const pMap = premiumYearMap(assumedSrc.sv.length ? assumedSrc.sv : (assumedSrc.av.length ? assumedSrc.av : assumedSrc.db));
-    result.sv = {
-      years, ages,
-      accountValue: seriesFromMap(years, avMap),
-      surrenderValue: seriesFromMap(years, svMap),
-      premium: seriesFromMap(years, pMap)
-    };
-    result.db = {
-      years, ages,
-      deathBenefit: seriesFromMap(years, dbMap),
-      premium: seriesFromMap(years, pMap)
-    };
+    const baseLow = flatLowBase || (isDualFlat ? flatLowWd : null);
+    const baseAssumed = flatAssumedBase || (isDualFlat ? flatAssumedWd : null);
+    const assembled = isDualFlat
+      ? assembleFlatPair(baseLow, baseAssumed, dualLowKind, false)
+      : assembleFlatPair(null, flatBest, null, false);
+    result.sv = assembled.sv;
+    result.db = assembled.db;
     if (isDualFlat){
       result.dualBasis = true;
+      result.dualKind = dualLowKind;
       result.assumedCreditingRate = extractAssumedCreditingRate(rawText);
-      const gAv = rowsToYearMap(flatGuaranteed.av, 'value');
-      const gSv = rowsToYearMap(flatGuaranteed.sv, 'value');
-      const gDb = rowsToYearMap(flatGuaranteed.db, 'value');
-      const aAv = rowsToYearMap(flatAssumed.av, 'value');
-      const aSv = rowsToYearMap(flatAssumed.sv, 'value');
-      const aDb = rowsToYearMap(flatAssumed.db, 'value');
-      result.sv.guaranteed = {
-        accountValue: seriesFromMap(years, gAv),
-        surrenderValue: seriesFromMap(years, gSv)
-      };
-      result.sv.currentAssumed = {
-        accountValue: seriesFromMap(years, aAv),
-        surrenderValue: seriesFromMap(years, aSv)
-      };
-      result.db.guaranteed = { deathBenefit: seriesFromMap(years, gDb) };
-      result.db.currentAssumed = { deathBenefit: seriesFromMap(years, aDb) };
+    }
+    if (entryHasValues(flatLowWd) && entryHasValues(flatAssumedWd)){
+      const wdPair = assembleFlatPair(flatLowWd, flatAssumedWd, dualLowKind || flatLowWd.basis, true);
+      result.svWithdrawal = wdPair.sv;
+      result.dbWithdrawal = wdPair.db;
     }
   }
 
-  result.svWithdrawal = buildWithdrawalSeries(svWdRowsRaw, extraWdKeys);
-  result.dbWithdrawal = buildWithdrawalSeries(dbWdRowsRaw, extraDbWdKeys);
+  if (!result.svWithdrawal) result.svWithdrawal = buildWithdrawalSeries(svWdRowsRaw, extraWdKeys);
+  if (!result.dbWithdrawal) result.dbWithdrawal = buildWithdrawalSeries(dbWdRowsRaw, extraDbWdKeys);
   if (result.svWithdrawal) overlayPremiumByYear(result.svWithdrawal, result.sv);
   if (result.dbWithdrawal) overlayPremiumByYear(result.dbWithdrawal, result.sv || result.db);
 
@@ -1035,6 +1242,13 @@ function visibleAssumedCreditingRate(){
 function dualBasisDisclaimer(longForm){
   const rate = visibleAssumedCreditingRate();
   const rateTxt = (rate != null) ? rate.toFixed(2) + '% ต่อปี' : 'ที่ระบุในเอกสาร';
+  const kind = relevantProductKeys().map(pk => dualLowKindOf(state.products[pk])).find(Boolean);
+  if (kind === 'conservative'){
+    if (longForm){
+      return 'เส้น Conservative คือมูลค่าเวนคืน/เงินคุ้มครองที่เอกสารแสดงภายใต้การเครดิต 0% (คิดค่าธรรมเนียมตามปัจจุบัน) ไม่ใช่ภาพ Pessimistic/Optimistic ส่วน Current Assumed ใช้สมมติฐานอัตราเครดิตของเอกสาร (' + rateTxt + ')';
+    }
+    return 'Conservative = เครดิต 0% · Current Assumed = สมมติฐาน ' + rateTxt;
+  }
   if (longForm){
     return 'เส้น Guaranteed ของ Surrender Value / Death Benefit คือตัวการันตีแยก (เช่น CGR) ที่เอกสารพิมพ์ไว้ตรง ๆ ไม่ได้มาจากการเอา Account Value ที่ credit อัตราขั้นต่ำมาหักค่าใช้จ่าย ส่วน Current Assumed ใช้สมมติฐานอัตราเครดิตคงที่ (' + rateTxt + ') ที่บริษัทเลือกมาแสดง ซึ่งอาจต่างจากผลจริงของกรมธรรม์แบบ UL/IUL';
   }
@@ -1056,6 +1270,7 @@ function resolveProductView(pk){
     svWithdrawal: p.svWithdrawal, dbWithdrawal: p.dbWithdrawal,
     scenario: useWd ? 'withdrawal' : 'base',
     dualBasis: !!p.dualBasis,
+    dualKind: p.dualKind || dualLowKindOf(p),
     assumedCreditingRate: p.assumedCreditingRate
   };
 }
@@ -1126,9 +1341,22 @@ const PALETTE = {
 /* Dual-basis UL lines: split Guaranteed vs Current Assumed by hue (not dash).
    Dash is reserved for Prepayment vs annual pay. */
 const DUAL_BASIS_LINE = {
-  p1: { guaranteed:'#2c5f8a', assumed:'#c8962c' },
-  p2: { guaranteed:'#4a8bb5', assumed:'#d4a24a' }
+  p1: { guaranteed:'#2c5f8a', conservative:'#2c5f8a', assumed:'#c8962c' },
+  p2: { guaranteed:'#4a8bb5', conservative:'#4a8bb5', assumed:'#d4a24a' }
 };
+function dualLowKindOf(p){
+  if (!p) return null;
+  if (p.dualKind) return p.dualKind;
+  if (p.sv && p.sv.conservative) return 'conservative';
+  if (p.sv && p.sv.guaranteed && p.sv.guaranteed.surrenderValue) return 'guaranteed';
+  return null;
+}
+function dualLowBucket(sv){
+  if (!sv) return null;
+  if (sv.conservative) return sv.conservative;
+  if (sv.guaranteed && sv.guaranteed.surrenderValue && !Array.isArray(sv.guaranteed)) return sv.guaranteed;
+  return null;
+}
 
 let chart = null;
 let wdChart = null;
@@ -1580,8 +1808,10 @@ function tooltipSeriesLabel(ds, cfg){
   if (core === 'Surrender Value: Guaranteed') return prefix + 'มูลค่าเวนคืน ส่วนการันตี เมื่อสิ้นปี';
   if (core === 'Surrender Value: Non-Guaranteed') return prefix + 'มูลค่าเวนคืน ส่วนลงทุน เมื่อสิ้นปี';
   if (core === 'Surrender Value (Guaranteed)') return prefix + 'มูลค่าเวนคืน (ฐานการันตี) เมื่อสิ้นปี';
+  if (core === 'Surrender Value (Conservative — 0% crediting)') return prefix + 'มูลค่าเวนคืน (Conservative — เครดิต 0%) เมื่อสิ้นปี';
   if (core === 'Surrender Value (Current Assumed)') return prefix + 'มูลค่าเวนคืน (ฐานสมมติปัจจุบัน) เมื่อสิ้นปี';
   if (core === 'Death Benefit (Guaranteed)') return prefix + 'เงินคุ้มครองชีวิต (ฐานการันตี)';
+  if (core === 'Death Benefit (Conservative — 0% crediting)') return prefix + 'เงินคุ้มครองชีวิต (Conservative — เครดิต 0%)';
   if (core === 'Death Benefit (Current Assumed)') return prefix + 'เงินคุ้มครองชีวิต (ฐานสมมติปัจจุบัน)';
   if (core === 'Account Value') return prefix + 'มูลค่าบัญชี';
   return raw;
@@ -1867,13 +2097,19 @@ function buildDatasetConfigs(){
           borderWidth:2.5, pointRadius:3, tension:.15, order:1, fill:false, legendColor: pal.dbTotal });
       }
     } else if (p.type === 'flat'){
-      if (p.dualBasis && p.sv && p.sv.guaranteed && p.sv.currentAssumed){
-        const gSv = alignToYears(years, p.sv.years, p.sv.ages, p.sv.guaranteed.surrenderValue);
+      const lowSv = dualLowBucket(p.sv);
+      if (p.dualBasis && lowSv && p.sv.currentAssumed){
+        const lowKind = dualLowKindOf(p) || 'guaranteed';
+        const gSv = alignToYears(years, p.sv.years, p.sv.ages, lowSv.surrenderValue);
         const aSv = alignToYears(years, p.sv.years, p.sv.ages, p.sv.currentAssumed.surrenderValue);
         const dualPal = DUAL_BASIS_LINE[pk] || DUAL_BASIS_LINE.p1;
+        const lowColor = dualPal[lowKind] || dualPal.guaranteed;
+        const lowSvLabel = lowKind === 'conservative'
+          ? 'Surrender Value (Conservative — 0% crediting)'
+          : 'Surrender Value (Guaranteed)';
         datasetConfigs.push({ id: pk+'_sv_sv_g', metric:'sv', product:pk, type:'line', stack: pk+'_sv_sv_g',
-          label: seriesLabel(pk, 'Surrender Value (Guaranteed)'), rawData: gSv.map(v=>v||0),
-          borderColor:dualPal.guaranteed, backgroundColor:dualPal.guaranteed, legendColor: dualPal.guaranteed,
+          label: seriesLabel(pk, lowSvLabel), rawData: gSv.map(v=>v||0),
+          borderColor:lowColor, backgroundColor:lowColor, legendColor: lowColor,
           borderWidth:2.5, pointRadius:3, tension:.15, order:0, fill:false });
         datasetConfigs.push({ id: pk+'_sv_sv_a', metric:'sv', product:pk, type:'line', stack: pk+'_sv_sv_a',
           label: seriesLabel(pk, 'Surrender Value (Current Assumed)'), rawData: aSv.map(v=>v||0),
@@ -1910,13 +2146,20 @@ function buildDatasetConfigs(){
           }
         }
       }
-      if (p.dualBasis && p.db && p.db.guaranteed && p.db.currentAssumed){
-        const gDb = alignToYears(years, p.db.years, p.db.ages, p.db.guaranteed.deathBenefit);
+      const lowDb = (p.db && p.db.conservative) ? p.db.conservative
+        : (p.db && p.db.guaranteed && p.db.guaranteed.deathBenefit && !Array.isArray(p.db.guaranteed)) ? p.db.guaranteed : null;
+      if (p.dualBasis && lowDb && p.db.currentAssumed){
+        const lowKind = dualLowKindOf(p) || 'guaranteed';
+        const gDb = alignToYears(years, p.db.years, p.db.ages, lowDb.deathBenefit);
         const aDb = alignToYears(years, p.db.years, p.db.ages, p.db.currentAssumed.deathBenefit);
         const dualPalDb = DUAL_BASIS_LINE[pk] || DUAL_BASIS_LINE.p1;
+        const lowColor = dualPalDb[lowKind] || dualPalDb.guaranteed;
+        const lowDbLabel = lowKind === 'conservative'
+          ? 'Death Benefit (Conservative — 0% crediting)'
+          : 'Death Benefit (Guaranteed)';
         datasetConfigs.push({ id: pk+'_db_db_g', metric:'db', product:pk, type:'line', stack: pk+'_db_db_g',
-          label: seriesLabel(pk, 'Death Benefit (Guaranteed)'), rawData: gDb.map(v=>v||0),
-          borderColor:dualPalDb.guaranteed, backgroundColor:dualPalDb.guaranteed, legendColor: dualPalDb.guaranteed,
+          label: seriesLabel(pk, lowDbLabel), rawData: gDb.map(v=>v||0),
+          borderColor:lowColor, backgroundColor:lowColor, legendColor: lowColor,
           borderWidth:2.5, pointRadius:3, tension:.15, order:0, fill:false });
         datasetConfigs.push({ id: pk+'_db_db_a', metric:'db', product:pk, type:'line', stack: pk+'_db_db_a',
           label: seriesLabel(pk, 'Death Benefit (Current Assumed)'), rawData: aDb.map(v=>v||0),
@@ -2350,7 +2593,8 @@ function getSvSeriesForXirr(product){
     totals = s.total; guaranteedArr = s.guaranteed; nonGuarArr = s.nonGuaranteed;
   } else {
     totals = s.surrenderValue || s.accountValue;
-    guaranteedArr = (product.dualBasis && s.guaranteed && s.guaranteed.surrenderValue) ? s.guaranteed.surrenderValue : null;
+    const lowForXirr = dualLowBucket(s);
+    guaranteedArr = (product.dualBasis && lowForXirr && lowForXirr.surrenderValue) ? lowForXirr.surrenderValue : null;
     nonGuarArr = null;
   }
   const premiums = s.premium || years.map(() => null);
@@ -2853,6 +3097,7 @@ async function handleFile(slot, file){
       label, type: parsed.type, sv: parsed.sv, db: parsed.db, prepayment: parsed.prepayment,
       svWithdrawal: parsed.svWithdrawal || null, dbWithdrawal: parsed.dbWithdrawal || null,
       dualBasis: !!parsed.dualBasis,
+      dualKind: parsed.dualKind || null,
       assumedCreditingRate: parsed.assumedCreditingRate || null
     };
     state.scenario['p' + slot] = 'base';
@@ -2864,7 +3109,9 @@ async function handleFile(slot, file){
     bits.push('ประเภท: ' + (parsed.type === 'par' ? 'Guaranteed/Non-Guaranteed (PAR)' : 'Account/Surrender/Death Benefit (UL)'));
     const nPts = (parsed.sv ? parsed.sv.years.length : 0) || (parsed.db ? parsed.db.years.length : 0);
     bits.push('จุดข้อมูล: ' + nPts + ' ปี');
-    if (parsed.dualBasis) bits.push('2 ฐาน: Guaranteed / Current Assumed');
+    if (parsed.dualBasis) bits.push(parsed.dualKind === 'conservative'
+      ? '2 ฐาน: Conservative / Current Assumed'
+      : '2 ฐาน: Guaranteed / Current Assumed');
     if (parsed.svWithdrawal || parsed.dbWithdrawal) bits.push('มีตาราง Withdrawal');
     nameEl.title = bits.join(' · ');
 
