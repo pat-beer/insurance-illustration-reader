@@ -239,7 +239,6 @@ function extractWithdrawalZone(dataRows, colHeaders, kind, yearCol, ageColIdx, p
     let ng = 0;
     ngCols.forEach(c => { const v = toNumber(r[c]); if (!isNaN(v)) ng += v; });
     const total = totalCol >= 0 ? toNumber(r[totalCol]) : NaN;
-    if (isNaN(guaranteed) && isNaN(total)) return;
 
     let premium = null;
     if (premiumColIdx !== null && premiumColIdx !== undefined && premiumColIdx >= 0){
@@ -252,11 +251,13 @@ function extractWithdrawalZone(dataRows, colHeaders, kind, yearCol, ageColIdx, p
     const notionalAfterWithdrawal = notionalCol >= 0 ? toNumber(r[notionalCol]) : NaN;
     const guaranteedCashValue = gcvCol >= 0 ? toNumber(r[gcvCol]) : NaN;
 
+    const bothMissing = isNaN(guaranteed) && isNaN(total);
+    if (bothMissing && premium === null) return;
     rows.push({
       year, age,
-      guaranteed: isNaN(guaranteed) ? 0 : guaranteed,
+      guaranteed: bothMissing ? null : (isNaN(guaranteed) ? 0 : guaranteed),
       nonGuaranteed: ng,
-      total: isNaN(total) ? (isNaN(guaranteed) ? 0 : guaranteed) : total,
+      total: bothMissing ? null : (isNaN(total) ? (isNaN(guaranteed) ? 0 : guaranteed) : total),
       premium,
       cashWithdrawal: isNaN(cashWithdrawal) ? 0 : cashWithdrawal,
       cumulativeWithdrawal: isNaN(cumulativeWithdrawal) ? 0 : cumulativeWithdrawal,
@@ -315,14 +316,21 @@ function extractParZone(dataRows, colHeaders, guaranteedCol, zoneEnd, yearCol, a
     let ng = 0;
     ngCols.forEach(c => { const v = toNumber(r[c]); if (!isNaN(v)) ng += v; });
     const total = toNumber(r[totalCol]);
-    if (isNaN(guaranteed) && isNaN(total)) return;
     let premium = null;
     if (premiumColIdx !== null && premiumColIdx !== undefined && premiumColIdx >= 0){
       const p = toNumber(r[premiumColIdx]);
       if (!isNaN(p)) premium = p;
     }
 
-    rows.push({ year, age, guaranteed: isNaN(guaranteed) ? 0 : guaranteed, nonGuaranteed: ng, total: isNaN(total) ? guaranteed : total, premium });
+    const bothMissing = isNaN(guaranteed) && isNaN(total);
+    if (bothMissing && premium === null) return;
+    rows.push({
+      year, age,
+      guaranteed: bothMissing ? null : (isNaN(guaranteed) ? 0 : guaranteed),
+      nonGuaranteed: ng,
+      total: bothMissing ? null : (isNaN(total) ? guaranteed : total),
+      premium
+    });
   });
   return rows;
 }
@@ -344,13 +352,13 @@ function extractFlatSeries(dataRows, colIdx, yearCol, ageColIdx, premiumColIdx){
       if (am) age = parseInt(am[1], 10);
     }
     const v = toNumber(r[colIdx]);
-    if (isNaN(v)) return;
     let premium = null;
     if (premiumColIdx !== null && premiumColIdx !== undefined && premiumColIdx >= 0){
       const p = toNumber(r[premiumColIdx]);
       if (!isNaN(p)) premium = p;
     }
-    rows.push({ year, age, value: v, premium });
+    if (isNaN(v) && premium === null) return;
+    rows.push({ year, age, value: isNaN(v) ? null : v, premium });
   });
   return rows;
 }
@@ -360,12 +368,16 @@ function resolveAgeOffset(rowsWithYear, rowsWithAge, compareKeys){
   for (const ar of rowsWithAge){
     for (const yr of rowsWithYear){
       let match = true;
+      let compared = 0;
       for (const k of compareKeys){
         const a = ar[k], b = yr[k];
-        if (a === undefined || b === undefined) continue;
-        if (Math.abs((a || 0) - (b || 0)) > 0.5) { match = false; break; } // these are duplicate rows in the source doc — expect exact match
+        if (a === undefined || b === undefined || a === null || b === null) continue;
+        if (typeof a === 'number' && isNaN(a)) continue;
+        if (typeof b === 'number' && isNaN(b)) continue;
+        compared++;
+        if (Math.abs(Number(a) - Number(b)) > 0.5) { match = false; break; } // these are duplicate rows in the source doc — expect exact match
       }
-      if (match) return ar.age - yr.year;
+      if (match && compared > 0) return ar.age - yr.year;
     }
   }
   return null;
