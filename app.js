@@ -89,6 +89,16 @@ function columnHeaders(headerRows, maxCols){
   }
   return cols;
 }
+/* Short metric labels ("Account Value", "Surrender Value", "Death Benefit") live
+   on the last header row. Earlier rows are basis titles and rate disclaimers that
+   may mention those same phrases in prose ("applicable to Surrender Value and
+   Death Benefit") and must not be treated as extra columns. */
+function columnLabelRow(headerRows, maxCols){
+  const last = (headerRows && headerRows.length) ? headerRows[headerRows.length - 1] : [];
+  const out = [];
+  for (let c = 0; c < maxCols; c++) out.push(cleanText(last[c] || ''));
+  return out;
+}
 
 /* ---------- Locate "guaranteed" zone-start columns (guaranteed, not non-guaranteed) ---------- */
 function findGuaranteedCols(colHeaders){
@@ -745,9 +755,10 @@ function attachInlineWithdrawalFields(rows, dataRows, colHeaders, inlineWdCol, y
   });
   return rows;
 }
-function findFlatMetricGroups(colHeaders){
+function findFlatMetricGroups(colHeaders, labelTexts){
+  const labels = (labelTexts && labelTexts.length) ? labelTexts : (colHeaders || []);
   const avs = [], svs = [], dbs = [];
-  (colHeaders || []).forEach((h, idx) => {
+  labels.forEach((h, idx) => {
     const lh = (h || '').toLowerCase();
     if (lh.includes('account value')) avs.push(idx);
     if (lh.includes('surrender value')) svs.push(idx);
@@ -759,7 +770,7 @@ function findFlatMetricGroups(colHeaders){
     const av = avs[i] !== undefined ? avs[i] : -1;
     const sv = svs[i] !== undefined ? svs[i] : -1;
     const db = dbs[i] !== undefined ? dbs[i] : -1;
-    const headerBits = [av, sv, db].filter(c => c >= 0).map(c => colHeaders[c]).join(' ');
+    const headerBits = [av, sv, db].filter(c => c >= 0).map(c => (colHeaders && colHeaders[c]) || '').join(' ');
     const basis = detectBasisFromText(headerBits);
     if (isAlternateScenarioBasis(basis)) continue;
     groups.push({ av, sv, db, basis: basis || 'single', headerBits });
@@ -784,9 +795,9 @@ function nearestBasisMarker(tableEl){
   }
   return null;
 }
-function countFlatMetricCols(colHeaders){
+function countFlatMetricCols(labelTexts){
   let av = 0, sv = 0, db = 0;
-  (colHeaders || []).forEach(h => {
+  (labelTexts || []).forEach(h => {
     const lh = (h || '').toLowerCase();
     if (lh.includes('account value')) av++;
     if (lh.includes('surrender value')) sv++;
@@ -799,8 +810,8 @@ function countDistinctPolicyYears(dataRows, yearCol){
   const years = (dataRows || []).map(r => parseInt(cleanText(r[col]), 10)).filter(y => y > 0);
   return new Set(years).size;
 }
-function isSideBySideBasisSummary(colHeaders, dataRows, yearCol){
-  const n = countFlatMetricCols(colHeaders);
+function isSideBySideBasisSummary(colHeaders, dataRows, yearCol, labelTexts){
+  const n = countFlatMetricCols(labelTexts || colHeaders);
   if (n.av < 2 || n.sv < 2) return false;
   return countDistinctPolicyYears(dataRows, yearCol) < 8;
 }
@@ -1041,13 +1052,14 @@ function parseIllustrationHtml(html, rawText){
     if (dataRowsRaw.length === 0 || headerRows.length === 0) return;
     let colHeaders = columnHeaders(headerRows, maxCols);
     let dataRows = dataRowsRaw;
+    const labelTexts = columnLabelRow(headerRows, maxCols);
     const fullHeaderLower = colHeaders.join(' ').toLowerCase();
     const nearBasis = nearestBasisMarker(tableEl);
     const yearCol = 0;
     const distinctYears = countDistinctPolicyYears(dataRows, yearCol);
     const headerBasis = detectBasisFromText(fullHeaderLower);
     if (tableUnderExcludedScenario(tableEl) || isExcludedIllustrationScenario(fullHeaderLower)) return;
-    if (isHonoredSummaryTable(nearBasis, headerBasis, distinctYears) || isSideBySideBasisSummary(colHeaders, dataRows, yearCol)) return;
+    if (isHonoredSummaryTable(nearBasis, headerBasis, distinctYears) || isSideBySideBasisSummary(colHeaders, dataRows, yearCol, labelTexts)) return;
     if (isSensitivityHeader(fullHeaderLower) && !hasPrimaryBasisHeader(fullHeaderLower)) return;
     function locateAgeCol(headers){
       let idx = null;
@@ -1121,7 +1133,7 @@ function parseIllustrationHtml(html, rawText){
       // Flat UL-style: Account / Surrender / Death Benefit. Side-by-side dual-basis
       // tables (Zurich) are split into one candidate per column group, using only
       // that group's header text for the basis tag — never the whole joined header.
-      const groups = findFlatMetricGroups(colHeaders);
+      const groups = findFlatMetricGroups(colHeaders, labelTexts);
       const hasWd = inlineWdCol >= 0;
       groups.forEach(group => {
         let basis = group.basis;
