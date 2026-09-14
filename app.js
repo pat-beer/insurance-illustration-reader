@@ -1213,7 +1213,7 @@ function nearestYearIndex(years, targetYear){
    =================================================================== */
 const state = {
   metric: 'sv', product: 'all', currency: 'usd', rate: 32.50,
-  hidden: new Set(), fontScale: 1, viewMode: 'compare', xirrProduct: 'p1', xAxisRange: 40,
+  hidden: new Set(), legendTouched: new Set(), fontScale: 1, viewMode: 'compare', xirrProduct: 'p1', xAxisRange: 40,
   scenario: { p1: 'base', p2: 'base' },
   showPrepay: true,
   products: { p1: null, p2: null } // each: {label, type, sv, db, svWithdrawal, dbWithdrawal} once parsed
@@ -2056,6 +2056,26 @@ function interpolateNulls(arr){
   }
   return out;
 }
+function interpolationFilledGaps(aligned){
+  if (!aligned || !aligned.length) return false;
+  const filled = interpolateNulls(aligned);
+  for (let i = 0; i < aligned.length; i++){
+    if (isChartGap(aligned[i]) && !isChartGap(filled[i])) return true;
+  }
+  return false;
+}
+const GHOST_INTERP_NOTE = 'เอกสารนี้ไม่ได้ระบุ Total Surrender Value (No Withdrawal) ครบทุกปีกรมธรรม์ — เส้นนี้เป็นการประมาณค่า (interpolation) ระหว่างปีที่มีข้อมูลจริงในเอกสารเท่านั้น ไม่ใช่ตัวเลขที่บริษัทประกันระบุไว้ตรงๆ';
+function resetLegendVisibility(){
+  state.hidden.clear();
+  if (state.legendTouched) state.legendTouched.clear();
+}
+function applyInterpolatedGhostDefaultHidden(){
+  (datasetConfigs || []).forEach(cfg => {
+    if (cfg.isGhostRef && cfg.wasInterpolated && !(state.legendTouched && state.legendTouched.has(cfg.id))){
+      state.hidden.add(cfg.id);
+    }
+  });
+}
 
 function buildDatasetConfigs(){
   datasetConfigs = [];
@@ -2107,6 +2127,7 @@ function buildDatasetConfigs(){
             rawPar.sv.total.some(v => v !== null && v !== undefined)){
           const ghost = alignToYears(years, rawPar.sv.years, rawPar.sv.ages, rawPar.sv.total);
           datasetConfigs.push({ id: pk+'_sv_t_ghost', metric:'sv', product:pk, type:'line', stack: pk+'_sv_t_ghost', isGhostRef:true,
+            wasInterpolated: interpolationFilledGaps(ghost),
             label: seriesLabel(pk, 'Total Surrender Value (No Withdrawal)'), rawData: interpolateNulls(ghost),
             borderColor: GHOST_LINE_COLOR, backgroundColor: GHOST_LINE_COLOR,
             borderWidth:1.6, pointRadius:0, tension:.15, order:5, fill:false });
@@ -2178,6 +2199,7 @@ function buildDatasetConfigs(){
               rawFlat.sv.surrenderValue.some(v => v !== null && v !== undefined)){
             const ghost = alignToYears(years, rawFlat.sv.years, rawFlat.sv.ages, rawFlat.sv.surrenderValue);
             datasetConfigs.push({ id: pk+'_sv_sv_ghost', metric:'sv', product:pk, type:'line', stack: pk+'_sv_sv_ghost', isGhostRef:true,
+              wasInterpolated: interpolationFilledGaps(ghost),
               label: seriesLabel(pk, 'Total Surrender Value (No Withdrawal)'), rawData: interpolateNulls(ghost),
               borderColor: GHOST_LINE_COLOR, backgroundColor: GHOST_LINE_COLOR,
               borderWidth:1.6, pointRadius:0, tension:.15, order:5, fill:false });
@@ -2412,6 +2434,7 @@ function buildLegend(){
     const isOff = state.hidden.has(cfg.id);
     const item = document.createElement('div');
     item.className = 'legend-item' + (isOff ? ' off' : '');
+    item.setAttribute('data-series', cfg.id);
     const swatch = document.createElement('span');
     swatch.className = 'swatch' + (cfg.type === 'line' ? ' line' : '');
     swatch.style.background = cfg.type === 'line' ? cfg.borderColor : (cfg.legendColor || cfg.backgroundColor);
@@ -2419,7 +2442,33 @@ function buildLegend(){
     lbl.className = 'lbl';
     lbl.textContent = cfg.label;
     item.appendChild(swatch); item.appendChild(lbl);
+    if (cfg.isGhostRef && cfg.wasInterpolated && !isOff){
+      const infoBtn = document.createElement('button');
+      infoBtn.type = 'button';
+      infoBtn.className = 'info-btn legend-interp-btn';
+      infoBtn.setAttribute('aria-label', 'คำอธิบายเส้นประมาณค่า');
+      infoBtn.setAttribute('aria-expanded', 'false');
+      const pop = document.createElement('span');
+      pop.className = 'info-pop';
+      pop.textContent = GHOST_INTERP_NOTE;
+      infoBtn.appendChild(document.createTextNode('ⓘ'));
+      infoBtn.appendChild(pop);
+      infoBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const wasOpen = infoBtn.classList.contains('is-open');
+        document.querySelectorAll('.info-btn.is-open').forEach(other => {
+          other.classList.remove('is-open');
+          other.setAttribute('aria-expanded', 'false');
+        });
+        if (!wasOpen){
+          infoBtn.classList.add('is-open');
+          infoBtn.setAttribute('aria-expanded', 'true');
+        }
+      });
+      item.appendChild(infoBtn);
+    }
     item.addEventListener('click', () => {
+      if (state.legendTouched) state.legendTouched.add(cfg.id);
       if (state.hidden.has(cfg.id)) state.hidden.delete(cfg.id); else state.hidden.add(cfg.id);
       render();
     });
@@ -2523,6 +2572,7 @@ function renderCompareView(){
   }
 
   const { years, ages } = buildDatasetConfigs();
+  applyInterpolatedGhostDefaultHidden();
   if (!years || years.length === 0){
     document.getElementById('emptyState').style.display = 'flex';
     document.getElementById('chartStack').style.display = 'none';
@@ -3154,7 +3204,7 @@ async function handleFile(slot, file){
     nameEl.title = bits.join(' · ');
 
     finalizeProductLabel(slot, label);
-    state.hidden.clear();
+    resetLegendVisibility();
     try {
       render();
     } catch (renderErr){
@@ -3221,16 +3271,16 @@ function wireSeg(segId, attr, onChange){
   });
 }
 wireSeg('viewModeSeg', 'data-view', (val) => { state.viewMode = val; render(); });
-wireSeg('metricSeg', 'data-metric', (val) => { state.metric = val; state.hidden.clear(); render(); });
+wireSeg('metricSeg', 'data-metric', (val) => { state.metric = val; resetLegendVisibility(); render(); });
 wireSeg('scenarioSeg', 'data-scenario', (val) => {
   relevantProductKeys().forEach(pk => {
     if (productHasWithdrawal(state.products[pk])) state.scenario[pk] = val;
   });
-  state.hidden.clear();
+  resetLegendVisibility();
   render();
 });
 wireSeg('prepaySeg', 'data-prepay', (val) => { state.showPrepay = (val === 'on'); render(); });
-wireSeg('productSeg', 'data-product', (val) => { state.product = val; state.hidden.clear(); render(); });
+wireSeg('productSeg', 'data-product', (val) => { state.product = val; resetLegendVisibility(); render(); });
 wireSeg('xirrProductSeg', 'data-xirrproduct', (val) => { state.xirrProduct = val; render(); });
 wireSeg('rangeSeg', 'data-range', (val) => { state.xAxisRange = (val === 'all') ? Infinity : parseInt(val, 10); render(); });
 wireSeg('currencySeg', 'data-ccy', (val) => {
