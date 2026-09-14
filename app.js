@@ -288,7 +288,7 @@ function overlayPremiumByYear(target, source){
     if (y !== null && y !== undefined && p !== null && p !== undefined && !map.has(y)) map.set(y, p);
   });
   if (map.size === 0) return;
-  target.premium = target.years.map(y => map.has(y) ? map.get(y) : null);
+  target.premium = forwardFillNulls(target.years.map(y => map.has(y) ? map.get(y) : null));
 }
 
 /* ---------- Extract a PAR-style zone (guaranteed + non-guaranteed(s) + total) ---------- */
@@ -2019,6 +2019,44 @@ function alignToYears(years, srcYears, srcAges, srcValues){
   return years.map(y => map.has(y) ? map.get(y) : null);
 }
 
+function isChartGap(v){
+  return v === null || v === undefined || (typeof v === 'number' && isNaN(v));
+}
+/* Cumulative quantities (premium paid): carry the last known value across unreported
+   years. After the payment term ends the line stays flat, never drops to zero. */
+function forwardFillNulls(arr){
+  let last = null;
+  return (arr || []).map(v => {
+    if (!isChartGap(v)) { last = v; return v; }
+    return last;
+  });
+}
+/* Continuous values that the document only samples at milestone years (SV, AV, DB,
+   notional, ghost refs). Linear-interpolate between known points; forward-fill any
+   trailing tail after the last sample. Leading gaps stay null. */
+function interpolateNulls(arr){
+  const out = (arr || []).slice();
+  let i = 0;
+  while (i < out.length){
+    if (!isChartGap(out[i])) { i++; continue; }
+    let next = i;
+    while (next < out.length && isChartGap(out[next])) next++;
+    const prev = i - 1;
+    if (prev < 0) { i = next; continue; }
+    if (next >= out.length){
+      for (let k = i; k < out.length; k++) out[k] = out[prev];
+      break;
+    }
+    const v0 = Number(out[prev]), v1 = Number(out[next]);
+    const span = next - prev;
+    for (let k = prev + 1; k < next; k++){
+      out[k] = v0 + (v1 - v0) * ((k - prev) / span);
+    }
+    i = next;
+  }
+  return out;
+}
+
 function buildDatasetConfigs(){
   datasetConfigs = [];
   const years = buildYearAgeLabels();
@@ -2062,14 +2100,14 @@ function buildDatasetConfigs(){
         datasetConfigs.push({ id: pk+'_sv_ng', metric:'sv', product:pk, type:'bar', stack:stackId,
           label: seriesLabel(pk, 'Surrender Value: Non-Guaranteed'), rawData:ng.map(v=>v||0), backgroundColor:scriptableBarColor(pal.nonGuaranteed), legendColor: pal.nonGuaranteed, order:3, minBarLength:2, borderColor:'#fff', borderWidth:1 });
         datasetConfigs.push({ id: pk+'_sv_t', metric:'sv', product:pk, type:'line', stack: pk+'_sv_t',
-          label: seriesLabel(pk, 'Total Surrender Value'), rawData:t.map(v=>v||0), borderColor:pal.total, backgroundColor:pal.total,
+          label: seriesLabel(pk, 'Total Surrender Value'), rawData:interpolateNulls(t), borderColor:pal.total, backgroundColor:pal.total,
           borderWidth:2.5, pointRadius:3, tension:.15, order:1, fill:false });
         const rawPar = state.products[pk];
         if (p.scenario === 'withdrawal' && rawPar && rawPar.sv && rawPar.sv.total &&
             rawPar.sv.total.some(v => v !== null && v !== undefined)){
           const ghost = alignToYears(years, rawPar.sv.years, rawPar.sv.ages, rawPar.sv.total);
           datasetConfigs.push({ id: pk+'_sv_t_ghost', metric:'sv', product:pk, type:'line', stack: pk+'_sv_t_ghost', isGhostRef:true,
-            label: seriesLabel(pk, 'Total Surrender Value (No Withdrawal)'), rawData: ghost.map(v=>v||0),
+            label: seriesLabel(pk, 'Total Surrender Value (No Withdrawal)'), rawData: interpolateNulls(ghost),
             borderColor: GHOST_LINE_COLOR, backgroundColor: GHOST_LINE_COLOR,
             borderWidth:1.6, pointRadius:0, tension:.15, order:5, fill:false });
         }
@@ -2093,7 +2131,7 @@ function buildDatasetConfigs(){
         datasetConfigs.push({ id: pk+'_db_cd', metric:'db', product:pk, type:'bar', stack:stackE,
           label: seriesLabel(pk, 'Death Benefit: Non-Guaranteed (C+D)'), rawData:cd.map(v=>v||0), backgroundColor:scriptableBarColor(pal.dbNonGuaranteed), legendColor: pal.dbNonGuaranteed, order:3, minBarLength:2, borderColor:'#fff', borderWidth:1 });
         datasetConfigs.push({ id: pk+'_db_t', metric:'db', product:pk, type:'line', stack: pk+'_db_t',
-          label: seriesLabel(pk, 'Net Death Benefit'), rawData:t.map(v=>v||0), borderColor:pal.dbTotal, backgroundColor:pal.dbTotal,
+          label: seriesLabel(pk, 'Net Death Benefit'), rawData:interpolateNulls(t), borderColor:pal.dbTotal, backgroundColor:pal.dbTotal,
           borderWidth:2.5, pointRadius:3, tension:.15, order:1, fill:false, legendColor: pal.dbTotal });
       }
     } else if (p.type === 'flat'){
@@ -2108,18 +2146,18 @@ function buildDatasetConfigs(){
           ? 'Surrender Value (Conservative — 0% crediting)'
           : 'Surrender Value (Guaranteed)';
         datasetConfigs.push({ id: pk+'_sv_sv_g', metric:'sv', product:pk, type:'line', stack: pk+'_sv_sv_g',
-          label: seriesLabel(pk, lowSvLabel), rawData: gSv.map(v=>v||0),
+          label: seriesLabel(pk, lowSvLabel), rawData: interpolateNulls(gSv),
           borderColor:lowColor, backgroundColor:lowColor, legendColor: lowColor,
           borderWidth:2.5, pointRadius:3, tension:.15, order:0, fill:false });
         datasetConfigs.push({ id: pk+'_sv_sv_a', metric:'sv', product:pk, type:'line', stack: pk+'_sv_sv_a',
-          label: seriesLabel(pk, 'Surrender Value (Current Assumed)'), rawData: aSv.map(v=>v||0),
+          label: seriesLabel(pk, 'Surrender Value (Current Assumed)'), rawData: interpolateNulls(aSv),
           borderColor:dualPal.assumed, backgroundColor:dualPal.assumed, legendColor: dualPal.assumed,
           borderWidth:2.5, pointRadius:3, tension:.15, order:0, fill:false });
         const avSrc = p.sv.currentAssumed.accountValue || p.sv.accountValue;
         if (avSrc && avSrc.some(v => v !== null && v !== undefined)){
           const av = alignToYears(years, p.sv.years, p.sv.ages, avSrc);
           datasetConfigs.push({ id: pk+'_sv_av', metric:'sv', product:pk, type:'line', stack: pk+'_sv_av', isAvRef:true,
-            label: seriesLabel(pk, 'Account Value'), rawData: av.map(v=>v||0),
+            label: seriesLabel(pk, 'Account Value'), rawData: interpolateNulls(av),
             borderColor:'#b8bec8', backgroundColor:'#b8bec8', legendColor:'#b8bec8',
             borderWidth:1.3, pointRadius:0, tension:.15, order:4, fill:false });
         }
@@ -2127,20 +2165,20 @@ function buildDatasetConfigs(){
         if (p.sv.accountValue && p.sv.accountValue.some(v=>v!==null)){
           const av = alignToYears(years, p.sv.years, p.sv.ages, p.sv.accountValue);
           datasetConfigs.push({ id: pk+'_sv_av', metric:'sv', product:pk, type:'line', stack: pk+'_sv_av',
-            label: seriesLabel(pk, 'Account Value'), rawData: av.map(v=>v||0), borderColor:pal.accountValue, backgroundColor:pal.accountValue,
+            label: seriesLabel(pk, 'Account Value'), rawData: interpolateNulls(av), borderColor:pal.accountValue, backgroundColor:pal.accountValue,
             borderWidth:2.5, pointRadius:3, tension:.15, order:0, fill:false });
         }
         if (p.sv.surrenderValue && p.sv.surrenderValue.some(v=>v!==null)){
           const sv = alignToYears(years, p.sv.years, p.sv.ages, p.sv.surrenderValue);
           datasetConfigs.push({ id: pk+'_sv_sv', metric:'sv', product:pk, type:'line', stack: pk+'_sv_sv',
-            label: seriesLabel(pk, 'Total Surrender Value'), rawData: sv.map(v=>v||0), borderColor:pal.surrenderValue, backgroundColor:pal.surrenderValue,
+            label: seriesLabel(pk, 'Total Surrender Value'), rawData: interpolateNulls(sv), borderColor:pal.surrenderValue, backgroundColor:pal.surrenderValue,
             borderWidth:2.5, pointRadius:3, tension:.15, order:0, fill:false });
           const rawFlat = state.products[pk];
           if (p.scenario === 'withdrawal' && rawFlat && rawFlat.sv && rawFlat.sv.surrenderValue &&
               rawFlat.sv.surrenderValue.some(v => v !== null && v !== undefined)){
             const ghost = alignToYears(years, rawFlat.sv.years, rawFlat.sv.ages, rawFlat.sv.surrenderValue);
             datasetConfigs.push({ id: pk+'_sv_sv_ghost', metric:'sv', product:pk, type:'line', stack: pk+'_sv_sv_ghost', isGhostRef:true,
-              label: seriesLabel(pk, 'Total Surrender Value (No Withdrawal)'), rawData: ghost.map(v=>v||0),
+              label: seriesLabel(pk, 'Total Surrender Value (No Withdrawal)'), rawData: interpolateNulls(ghost),
               borderColor: GHOST_LINE_COLOR, backgroundColor: GHOST_LINE_COLOR,
               borderWidth:1.6, pointRadius:0, tension:.15, order:5, fill:false });
           }
@@ -2158,17 +2196,17 @@ function buildDatasetConfigs(){
           ? 'Death Benefit (Conservative — 0% crediting)'
           : 'Death Benefit (Guaranteed)';
         datasetConfigs.push({ id: pk+'_db_db_g', metric:'db', product:pk, type:'line', stack: pk+'_db_db_g',
-          label: seriesLabel(pk, lowDbLabel), rawData: gDb.map(v=>v||0),
+          label: seriesLabel(pk, lowDbLabel), rawData: interpolateNulls(gDb),
           borderColor:lowColor, backgroundColor:lowColor, legendColor: lowColor,
           borderWidth:2.5, pointRadius:3, tension:.15, order:0, fill:false });
         datasetConfigs.push({ id: pk+'_db_db_a', metric:'db', product:pk, type:'line', stack: pk+'_db_db_a',
-          label: seriesLabel(pk, 'Death Benefit (Current Assumed)'), rawData: aDb.map(v=>v||0),
+          label: seriesLabel(pk, 'Death Benefit (Current Assumed)'), rawData: interpolateNulls(aDb),
           borderColor:dualPalDb.assumed, backgroundColor:dualPalDb.assumed, legendColor: dualPalDb.assumed,
           borderWidth:2.5, pointRadius:3, tension:.15, order:0, fill:false });
       } else if (p.db && p.db.deathBenefit && p.db.deathBenefit.some(v=>v!==null)){
         const db = alignToYears(years, p.db.years, p.db.ages, p.db.deathBenefit);
         datasetConfigs.push({ id: pk+'_db_db', metric:'db', product:pk, type:'line', stack: pk+'_db_db',
-          label: seriesLabel(pk, 'Death Benefit'), rawData: db.map(v=>v||0), borderColor:pal.deathBenefit, backgroundColor:pal.deathBenefit,
+          label: seriesLabel(pk, 'Death Benefit'), rawData: interpolateNulls(db), borderColor:pal.deathBenefit, backgroundColor:pal.deathBenefit,
           borderWidth:2.5, pointRadius:3, tension:.15, order:0, fill:false });
       }
     }
@@ -2180,7 +2218,7 @@ function buildDatasetConfigs(){
       const premAligned = alignToYears(years, p.sv.years, p.sv.ages, p.sv.premium);
       ['sv','db'].forEach(m => {
         datasetConfigs.push({ id: pk+'_'+m+'_premium', metric:m, product:pk, type:'line', stack: pk+'_'+m+'_premium', isPremiumRef:true,
-          label: seriesLabel(pk, 'Total Premium Paid'), rawData: premAligned.map(v=>v||0),
+          label: seriesLabel(pk, 'Total Premium Paid'), rawData: forwardFillNulls(premAligned),
           borderColor:'#6b7688', backgroundColor:'#6b7688', legendColor:'#6b7688',
           borderWidth:2.3, pointRadius:0, tension:0, order:2, fill:false });
       });
@@ -2203,7 +2241,7 @@ function buildDatasetConfigs(){
       if (nSrc && nSrc.notionalAfterWithdrawal.some(v => v !== null && v !== undefined)){
         const notionalAligned = alignToYears(years, nSrc.years, nSrc.ages, nSrc.notionalAfterWithdrawal);
         datasetConfigs.push({ id: pk+'_db_notional', metric:'db', product:pk, type:'line', stack: pk+'_db_notional', isNotionalRef:true,
-          label: seriesLabel(pk, 'Notional Amount After Cash Withdrawal'), rawData: notionalAligned.map(v=>v||0),
+          label: seriesLabel(pk, 'Notional Amount After Cash Withdrawal'), rawData: interpolateNulls(notionalAligned),
           borderColor:'#2a9d8f', backgroundColor:'#2a9d8f', legendColor:'#2a9d8f',
           borderWidth:2.3, pointRadius:0, tension:0, order:2, fill:false });
       }
