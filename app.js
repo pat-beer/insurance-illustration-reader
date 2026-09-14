@@ -683,6 +683,7 @@ function attachInlineWithdrawalFields(rows, dataRows, colHeaders, inlineWdCol, y
     row.cashWithdrawal = extra.cashWithdrawal;
     row.cumulativeWithdrawal = extra.cumulativeWithdrawal;
     if (extra.notionalAfterWithdrawal !== null) row.notionalAfterWithdrawal = extra.notionalAfterWithdrawal;
+    row.fromInlineWithdrawal = true;
   });
   return rows;
 }
@@ -865,6 +866,103 @@ function assembleFlatPair(lowEntry, assumedEntry, lowKind, withWithdrawal){
   return { sv, db };
 }
 
+function withdrawalAmountPositive(v){
+  return v !== null && v !== undefined && !isNaN(v) && Number(v) > 0;
+}
+function numericDisagree(a, b){
+  if (a === null || a === undefined || b === null || b === undefined) return false;
+  if (isNaN(a) || isNaN(b)) return false;
+  return Math.abs(Number(a) - Number(b)) > 0.5;
+}
+function noteZeroWdDisagreement(notes, msg){
+  notes.push(msg);
+  if (typeof console !== 'undefined' && console.warn) console.warn('zero-wd merge disagreement', msg);
+}
+/* Years on a withdrawal-scenario table whose inline withdrawal is 0 / blank / "-"
+   are genuine No-Withdrawal observations. Merge those into the base series for
+   years the sparse milestone table does not already print. On overlap, keep the
+   milestone value if the two disagree. */
+function zeroWithdrawalYearsFromFlatEntry(entry){
+  const positive = new Set();
+  (entry && entry.wd || []).forEach(r => {
+    if (r.year != null && withdrawalAmountPositive(r.value)) positive.add(r.year);
+  });
+  const years = new Set();
+  ['av', 'sv', 'db'].forEach(k => {
+    ((entry && entry[k]) || []).forEach(r => {
+      if (r.year != null && !positive.has(r.year)) years.add(r.year);
+    });
+  });
+  return years;
+}
+function mergeFlatMetricRows(baseRows, wdRows, zeroYears, notes, label){
+  if (!baseRows || !wdRows) return;
+  const byYear = new Map();
+  baseRows.forEach(r => { if (r.year != null && !byYear.has(r.year)) byYear.set(r.year, r); });
+  wdRows.forEach(r => {
+    if (r.year == null || !zeroYears.has(r.year)) return;
+    const existing = byYear.get(r.year);
+    if (!existing){
+      baseRows.push({ year: r.year, age: r.age, value: r.value, premium: r.premium });
+      byYear.set(r.year, r);
+      return;
+    }
+    if (numericDisagree(existing.value, r.value)){
+      noteZeroWdDisagreement(notes, label + ' Y' + r.year + ' base=' + existing.value + ' annual=' + r.value);
+    }
+  });
+}
+function enrichFlatBaseFromZeroWithdrawal(flatCandidates){
+  const notes = [];
+  const byBasis = {};
+  Object.keys(flatCandidates || {}).forEach(k => {
+    const e = flatCandidates[k];
+    if (!e || e.basis === 'sensitivity' || e.basis === 'summary') return;
+    if (!byBasis[e.basis]) byBasis[e.basis] = {};
+    byBasis[e.basis][e.hasWithdrawal ? 'wd' : 'base'] = e;
+  });
+  Object.keys(byBasis).forEach(basis => {
+    const pair = byBasis[basis];
+    if (!pair.wd) return;
+    if (!pair.base){
+      pair.base = { av: [], sv: [], db: [], wd: [], basis, hasWithdrawal: false };
+      flatCandidates[basis + '||base'] = pair.base;
+    }
+    const zeroYears = zeroWithdrawalYearsFromFlatEntry(pair.wd);
+    ['av', 'sv', 'db'].forEach(k => {
+      mergeFlatMetricRows(pair.base[k], pair.wd[k], zeroYears, notes, basis + ' ' + k);
+    });
+  });
+  return notes;
+}
+function mergeZeroWdParIntoBase(baseRows, wdRows, notes, label){
+  if (!wdRows || !wdRows.length) return baseRows;
+  const out = (baseRows || []).slice();
+  const byYear = new Map();
+  out.forEach(r => { if (r.year != null && !byYear.has(r.year)) byYear.set(r.year, r); });
+  wdRows.forEach(r => {
+    if (!r.fromInlineWithdrawal) return;
+    if (r.year == null || withdrawalAmountPositive(r.cashWithdrawal)) return;
+    const existing = byYear.get(r.year);
+    if (!existing){
+      const copy = {
+        year: r.year, age: r.age,
+        guaranteed: r.guaranteed, nonGuaranteed: r.nonGuaranteed, total: r.total,
+        premium: r.premium
+      };
+      out.push(copy);
+      byYear.set(r.year, copy);
+      return;
+    }
+    if (numericDisagree(existing.guaranteed, r.guaranteed) || numericDisagree(existing.total, r.total)){
+      noteZeroWdDisagreement(notes, label + ' Y' + r.year +
+        ' baseG=' + existing.guaranteed + ' annualG=' + r.guaranteed +
+        ' baseT=' + existing.total + ' annualT=' + r.total);
+    }
+  });
+  return out;
+}
+
 /* ---------- Main parser: given mammoth HTML string, extract SV/DB series ---------- */
 function parseIllustrationHtml(html, rawText){
   const parser = new DOMParser();
@@ -983,6 +1081,8 @@ function parseIllustrationHtml(html, rawText){
     }
   });
 
+  const zeroWdNotes = enrichFlatBaseFromZeroWithdrawal(flatCandidates);
+
   function pickBest(candidates){
     let best = null, bestLen = 0;
     Object.values(candidates).forEach(rows => {
@@ -1018,10 +1118,10 @@ function parseIllustrationHtml(html, rawText){
     return !!(entry && ((entry.sv && entry.sv.length) || (entry.av && entry.av.length)));
   }
 
-  const svRowsRaw = pickBest(svCandidates);
-  const dbRowsRaw = pickBest(dbCandidates);
   const svWdRowsRaw = pickBest(svWithdrawalCandidates);
   const dbWdRowsRaw = pickBest(dbWithdrawalCandidates);
+  const svRowsRaw = mergeZeroWdParIntoBase(pickBest(svCandidates), svWdRowsRaw, zeroWdNotes, 'par-sv');
+  const dbRowsRaw = mergeZeroWdParIntoBase(pickBest(dbCandidates), dbWdRowsRaw, zeroWdNotes, 'par-db');
   const flatLowBase = pickPrimaryLow(false);
   const flatAssumedBase = pickBestFlatByBasis(flatCandidates, 'currentAssumed', false);
   const flatLowWd = pickPrimaryLow(true);
@@ -1037,7 +1137,7 @@ function parseIllustrationHtml(html, rawText){
   const meta = extractMetadata(rawText, doc);
   const prepayment = extractPrepaymentInfo(doc, rawText);
 
-  const result = { type: null, meta, sv: null, db: null, svWithdrawal: null, dbWithdrawal: null, prepayment, dualBasis: false, assumedCreditingRate: null };
+  const result = { type: null, meta, sv: null, db: null, svWithdrawal: null, dbWithdrawal: null, prepayment, dualBasis: false, assumedCreditingRate: null, zeroWdMergeNotes: zeroWdNotes };
 
   const extraWdKeys = ['cashWithdrawal', 'cumulativeWithdrawal', 'notionalAfterWithdrawal'];
   const extraDbWdKeys = extraWdKeys.concat(['guaranteedCashValue']);
