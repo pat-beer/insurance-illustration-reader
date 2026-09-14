@@ -18,6 +18,7 @@
         <div class="sub">อ่านเอกสาร Word (Summary Illustration) แล้วสร้างกราฟเปรียบเทียบอัตโนมัติ</div>
       </div>
       <div class="masthead-right">
+        <button type="button" class="glossary-btn" id="glossaryBtn" aria-haspopup="dialog" aria-controls="glossaryOverlay">ⓘ คำอธิบายศัพท์</button>
         <div class="fs-seg" id="fontSeg">
           <button data-fs="1" class="fs-btn active">เล็ก</button>
           <button data-fs="1.18" class="fs-btn">กลาง</button>
@@ -55,6 +56,21 @@
           <div class="seg" id="metricSeg">
             <button data-metric="sv" class="seg-btn active">Surrender Value</button>
             <button data-metric="db" class="seg-btn">Death Benefit</button>
+          </div>
+        </div>
+        <div class="seg-group" id="scenarioGroup" style="display:none;">
+          <span class="seg-label">สถานการณ์</span>
+          <div class="seg" id="scenarioSeg">
+            <button data-scenario="base" class="seg-btn active">No Withdrawal</button>
+            <button data-scenario="withdrawal" class="seg-btn">Withdrawal</button>
+          </div>
+          <div class="scenario-hint" id="scenarioHint" style="display:none;"></div>
+        </div>
+        <div class="seg-group" id="prepayGroup" style="display:none;">
+          <span class="seg-label">แสดง Prepayment</span>
+          <div class="seg" id="prepaySeg">
+            <button data-prepay="on" class="seg-btn active">เปิด</button>
+            <button data-prepay="off" class="seg-btn">ปิด</button>
           </div>
         </div>
         <div class="seg-group" id="productFilterGroup">
@@ -97,12 +113,21 @@
     </div>
 
     <div class="chart-card" id="compareView">
-      <div class="chart-hint" id="chartHint" style="display:none;"></div>
+      <div class="chart-hint-row" id="chartHintRow" style="display:none;">
+        <span class="chart-hint" id="chartHint"></span>
+        <button type="button" class="info-btn" id="chartPurposeBtn" aria-label="กราฟนี้แสดงอะไร" aria-expanded="false">ⓘ<span class="info-pop" id="chartPurposePop"></span></button>
+      </div>
       <div class="xirr-legend-note" id="compareLegendNote" style="display:none;">
         <span>🚩 <span style="color:#c0392b;font-weight:400;">แดง</span> = Cash Breakeven</span>
         <span>🚩 <span style="color:#1f7a4d;font-weight:400;">เขียว</span> = Guaranteed Breakeven</span>
       </div>
-      <div id="chartHolder" style="display:none;"><canvas id="cmp"></canvas></div>
+      <div id="chartStack" style="display:none;">
+        <div id="chartHolder"><canvas id="cmp"></canvas></div>
+        <div id="wdPanelHolder" style="display:none;">
+          <button type="button" class="info-btn info-btn-overlay" id="wdPurposeBtn" aria-label="แผงเงินถอนแสดงอะไร" aria-expanded="false">ⓘ<span class="info-pop">จำนวนเงินที่ถอนออกจากกรมธรรม์ในแต่ละปี (ไม่ใช่ยอดสะสม)</span></button>
+          <canvas id="wdPanel"></canvas>
+        </div>
+      </div>
       <div class="empty-state" id="emptyState">
         <div class="icon">📄</div>
         <div class="title">อัปโหลดเอกสาร Word เพื่อเริ่มต้น</div>
@@ -118,9 +143,12 @@
       <div class="xirr-legend-note" id="xirrLegendNote" style="display:none;">
         <span>🚩 <span style="color:#c0392b;font-weight:400;">แดง</span> = Cash Breakeven</span>
         <span>🚩 <span style="color:#1f7a4d;font-weight:400;">เขียว</span> = Guaranteed Breakeven</span>
-        <span>เส้นทึบ = จ่ายทีละปี (ปกติ) &nbsp;|&nbsp; เส้นประ = Prepayment</span>
+        <span id="xirrPrepayLegendNote">เส้นทึบ = จ่ายทีละปี (ปกติ) &nbsp;|&nbsp; เส้นประ = Prepayment</span>
       </div>
-      <div class="chart-hint" id="xirrChartHint">แกน X = สิ้นปีกรมธรรม์ &nbsp;|&nbsp; แกน Y = XIRR (% p.a.)</div>
+      <div class="chart-hint-row" id="xirrChartHintRow">
+        <span class="chart-hint" id="xirrChartHint">แกน X = สิ้นปีกรมธรรม์ &nbsp;|&nbsp; แกน Y = XIRR (% p.a.)</span>
+        <button type="button" class="info-btn" id="xirrPurposeBtn" aria-label="กราฟ XIRR แสดงอะไร" aria-expanded="false">ⓘ<span class="info-pop">อัตราผลตอบแทนทบต้นต่อปี จากเบี้ยที่จ่ายเทียบกับมูลค่าเวนคืนในแต่ละปี</span></button>
+      </div>
       <div id="xirrChartHolder"><canvas id="xirrCanvas"></canvas></div>
       <div class="empty-state" id="xirrEmptyState">
         <div class="icon">📈</div>
@@ -153,6 +181,74 @@
 
 </div>
 
+<div class="glossary-overlay" id="glossaryOverlay" hidden>
+  <div class="glossary-modal" role="dialog" aria-modal="true" aria-labelledby="glossaryTitle">
+    <div class="glossary-head">
+      <h2 id="glossaryTitle">คำอธิบายศัพท์</h2>
+      <button type="button" class="glossary-close" id="glossaryClose" aria-label="ปิด">×</button>
+    </div>
+    <div class="glossary-body">
+      <section class="glossary-item" id="gloss-guaranteed">
+        <h3>Guaranteed / Non-Guaranteed <span class="glossary-en">มูลค่าเวนคืน</span></h3>
+        <p><strong>Guaranteed</strong> คือมูลค่าเงินสดที่บริษัทประกันสัญญาว่าจะจ่ายให้ หากเวนคืนกรมธรรม์ในปีนั้น — ไม่ขึ้นกับผลลงทุนว่าจะดีหรือไม่</p>
+        <p><strong>Non-Guaranteed</strong> คือส่วนโบนัสหรือผลตอบแทนที่ประมาณการไว้ในเอกสาร แต่ไม่ได้สัญญา จะสูงหรือต่ำกว่าที่เห็นก็ได้</p>
+      </section>
+      <section class="glossary-item" id="gloss-death-benefit">
+        <h3>Death Benefit <span class="glossary-en">Guaranteed (B) / Cash Value (A) / Non-Guaranteed (C+D) / Net</span></h3>
+        <p>กรมธรรม์แบบมีส่วนร่วมในกำไรจะเทียบสองก้อน: <strong>(B)</strong> ทุนประกันที่การันตี กับ <strong>(A)+(C+D)=(E)</strong> ซึ่งคือมูลค่าเงินสดการันตีบวกโบนัสที่ยังไม่การันตี</p>
+        <p><strong>Net Death Benefit</strong> คือยอดที่สูงกว่าระหว่างสองก้อนนี้ — นั่นคือเงินที่ผู้รับผลประโยชน์น่าจะได้รับในสถานการณ์ที่เอกสารแสดง</p>
+      </section>
+      <section class="glossary-item" id="gloss-total-sv">
+        <h3>Total Surrender Value <span class="glossary-en">vs Total Surrender Value (No Withdrawal)</span></h3>
+        <p><strong>Total Surrender Value</strong> คือมูลค่าเวนคืน ณ ปีนั้น หลังหักผลจากการถอนเงินแล้ว</p>
+        <p>เส้นจาง <strong>(No Withdrawal)</strong> คือมูลค่าที่กรมธรรม์จะมี หากไม่เคยถอนเงินออกเลย — ใช้เทียบว่าการถอนลดมูลค่าลงเท่าไร</p>
+      </section>
+      <section class="glossary-item" id="gloss-xirr">
+        <h3>XIRR <span class="glossary-en">อัตรามูลค่าเติบโต “ทบต้นตามเวลา”</span></h3>
+        <p>อัตราผลตอบแทนทบต้นต่อปี ที่ทำให้กระแสเงินสดสมดุล: เบี้ยที่จ่ายออกไป เทียบกับมูลค่าเวนคืนที่ได้รับคืนในปีนั้น (รวมเงินที่ถอนไปแล้วถ้ามี)</p>
+        <p>ไม่ใช่ดอกเบี้ยที่บริษัทสัญญาจ่าย แต่เป็นตัวเลขประมาณการเพื่อเทียบสินค้าและดูว่าคุ้มทุนเมื่อไร</p>
+      </section>
+      <section class="glossary-item" id="gloss-breakeven">
+        <h3>Cash Breakeven / Guaranteed Breakeven <span class="glossary-en">ธงแดง / ธงเขียว</span></h3>
+        <p><strong>Cash Breakeven</strong> (ธงแดง) คือปีที่ XIRR เพิ่งตัดผ่าน 0% — มูลค่าเวนคืนเริ่มคุ้มกับเบี้ยที่จ่ายไปทั้งหมด</p>
+        <p><strong>Guaranteed Breakeven</strong> (ธงเขียว) คือปีที่เฉพาะส่วนการันตีตามทันเบี้ยที่จ่าย โดยไม่พึ่งโบนัส</p>
+        <p>ปีที่แสดงเป็นทศนิยม 1 ตำแหน่ง เพราะประมาณค่าระหว่างปี เช่น ปี 8.3 หมายถึงราว ๆ กลางปีที่ 8–9</p>
+      </section>
+      <section class="glossary-item" id="gloss-prepayment">
+        <h3>Prepayment <span class="glossary-en">จ่ายเบี้ยล่วงหน้า</span></h3>
+        <p>จ่ายเบี้ยที่เหลือทั้งหมดเป็นก้อนเดียวตอนต้น แทนที่จะจ่ายทีละปี มักได้ส่วนลดจึงทำให้เบี้ยรวมต่ำกว่า แต่เงินออกจากกระเป๋าเร็วกว่า</p>
+      </section>
+      <section class="glossary-item" id="gloss-notional">
+        <h3>Notional Amount <span class="glossary-en">After Cash Withdrawal</span></h3>
+        <p>ทุนประกันหรือฐานที่ใช้คำนวณความคุ้มครองกรณีเสียชีวิต หลังมีการถอนเงิน</p>
+        <p>หากถอนต่อเนื่องจนเกินส่วนโบนัสที่ไม่การันตี ทุนนี้จะค่อย ๆ ลดลง และอาจกระทบเงินเอาประกัน</p>
+      </section>
+      <section class="glossary-item" id="gloss-acc-wd">
+        <h3>Acc. Withdrawal <span class="glossary-en">มูลค่าเงินถอนสะสม</span></h3>
+        <p>ยอดเงินสดที่ถอนออกจากกรมธรรม์สะสมถึงปีนั้น รวมทุกรอบที่ถอนมาแล้ว</p>
+      </section>
+      <section class="glossary-item" id="gloss-payout">
+        <h3>Payout Ratio (Withdrawal) <span class="glossary-en">อัตราการจ่ายจากเงินถอน</span></h3>
+        <p>เงินถอนสะสม ÷ เบี้ยที่จ่ายไปทั้งหมด บอกว่าถอนคืนมาแล้วกี่เท่าของเบี้ย (ยังไม่นับเงินที่ยังอยู่ในกรมธรรม์)</p>
+      </section>
+      <section class="glossary-item" id="gloss-net-payout">
+        <h3>Net / Total Payout Ratio <span class="glossary-en">อัตราการจ่ายสุทธิ / รวมเงินถอน</span></h3>
+        <p>(เงินถอนสะสม + มูลค่าเวนคืนปัจจุบัน) ÷ เบี้ยที่จ่ายไปทั้งหมด</p>
+        <p>เรียก <strong>Net</strong> เมื่อยังไม่มีการถอน และ <strong>Total (Withdrawal)</strong> เมื่อเริ่มถอนแล้ว — สองแบบใช้สูตรเดียวกัน</p>
+      </section>
+      <section class="glossary-item" id="gloss-premium">
+        <h3>Total Premium Paid <span class="glossary-en">vs Total Premium Paid (Prepayment)</span></h3>
+        <p>เส้นอ้างอิงสีเทาคือเบี้ยสะสมถ้าจ่ายรายปีตามตาราง ส่วนเส้นประคือเบี้ยสะสมถ้าจ่ายก้อนเดียวล่วงหน้า ซึ่งมักต่ำกว่าเพราะมีส่วนลด</p>
+      </section>
+      <section class="glossary-item" id="gloss-dual-basis">
+        <h3>Guaranteed Basis / Current Assumed Basis <span class="glossary-en">กรมธรรม์แบบ UL สองฐาน</span></h3>
+        <p><strong>Guaranteed</strong> คือภาพกรณีแย่ที่สุดตามค่าธรรมเนียมและอัตราขั้นต่ำที่บริษัทการันตี — ไม่ใช่ผลที่คาดว่าจะได้</p>
+        <p><strong>Current Assumed</strong> คือภาพประมาณการด้วยอัตราเครดิตคงที่ที่บริษัทเลือกมาแสดงในเอกสาร (อ่านจากเอกสารแต่ละฉบับ) ซึ่งอาจต่างจากผลจริงของกลไก UL/IUL ที่ขึ้นกับผลดัชนีและพื้นอัตรา</p>
+        <p>เส้น Guaranteed ของ Surrender Value / Death Benefit ไม่ได้มาจากการเอา Account Value (ที่ credit ด้วยอัตราขั้นต่ำ) มาหักค่าใช้จ่าย แต่เป็นตัวการันตีแยกต่างหากที่บริษัทสัญญาไว้ตรง ๆ (เช่น สะสมไม่น้อยกว่า X% ต่อปีในช่วง Y ปีแรก และ Z% หลังจากนั้น) ใช้กับ Surrender Value และ Death Benefit โดยตรง — คนละกลไกกับ Crediting Rate ที่ใช้กับ Account Value เท่านั้น</p>
+      </section>
+    </div>
+  </div>
+</div>
 
 <script src="app.js"></script>
 </body>

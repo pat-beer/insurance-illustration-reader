@@ -132,6 +132,164 @@ function findPremiumCol(colHeaders, fromIdx, toIdx){
   return -1;
 }
 
+function findHeaderCol(colHeaders, pred){
+  for (let i = 0; i < colHeaders.length; i++){
+    if (pred(normHeader(colHeaders[i]), colHeaders[i], i)) return i;
+  }
+  return -1;
+}
+
+/* Mammoth often emits each Word column twice for these wide supplementary tables.
+   Collapse consecutive identical headers (and their data cells) so downstream
+   column matching sees the printed layout, not the duplicated grid. */
+function collapseDuplicateHeaderColumns(colHeaders, dataRows){
+  const idxs = [];
+  for (let c = 0; c < colHeaders.length; c++){
+    if (c > 0 && normHeader(colHeaders[c]) === normHeader(colHeaders[c - 1]) && colHeaders[c] !== '') continue;
+    idxs.push(c);
+  }
+  if (idxs.length === colHeaders.length) return { colHeaders, dataRows };
+  return {
+    colHeaders: idxs.map(i => colHeaders[i]),
+    dataRows: dataRows.map(r => idxs.map(i => r[i] !== undefined ? r[i] : ''))
+  };
+}
+
+function isAfterCashWithdrawalHeader(fullHeaderLower){
+  return /after\s*cash\s*withdrawal/i.test(fullHeaderLower);
+}
+
+function headerCompact(t){
+  return normHeader(t).replace(/[^a-z0-9+()#]/g, '');
+}
+function headerHas(t, snippet){
+  return headerCompact(t).includes(String(snippet).replace(/[^a-z0-9+()#]/g, ''));
+}
+
+/* Dedicated extractor for "… AFTER CASH WITHDRAWAL" SV/DB tables.
+   Does not reuse extractParZone: those tables have extra withdrawal / notional /
+   (A)+(E) columns, and the DB table has two "Guaranteed" markers that would
+   otherwise be misread as a combined SV+DB layout. */
+function extractWithdrawalZone(dataRows, colHeaders, kind, yearCol, ageColIdx, premiumColIdx){
+  const cashWdCol = findHeaderCol(colHeaders, (t, _raw) => headerHas(t, 'cashwithdrawalamount') && !headerHas(t, 'cumulative'));
+  const cumWdCol = findHeaderCol(colHeaders, (t, _raw) =>
+    headerHas(t, 'cumulative') && headerHas(t, 'withdrawal') && !headerHas(t, 'surrender') && !t.includes('+')
+  );
+  const notionalCol = findHeaderCol(colHeaders, t => headerHas(t, 'notional'));
+
+  let guaranteedCol = -1, gcvCol = -1, totalCol = -1;
+  if (kind === 'db'){
+    gcvCol = findHeaderCol(colHeaders, t =>
+      headerHas(t, 'guaranteed') && headerHas(t, 'cashvalue') &&
+      !headerHas(t, 'nonguaranteed')
+    );
+    guaranteedCol = findHeaderCol(colHeaders, t =>
+      (headerHas(t, 'guaranteed#') || (headerHas(t, 'guaranteed') && t.includes('(b)'))) &&
+      !headerHas(t, 'nonguaranteed') && !headerHas(t, 'cashvalue')
+    );
+    if (guaranteedCol < 0){
+      guaranteedCol = findHeaderCol(colHeaders, t =>
+        headerHas(t, 'guaranteed') && !headerHas(t, 'nonguaranteed') &&
+        !headerHas(t, 'cashvalue') && t.length <= 80
+      );
+    }
+    totalCol = findHeaderCol(colHeaders, t => /higherof|higher of/.test(headerCompact(t) + ' ' + t));
+  } else {
+    guaranteedCol = findHeaderCol(colHeaders, t =>
+      headerHas(t, 'guaranteed') && !headerHas(t, 'nonguaranteed') && t.length <= 80
+    );
+    totalCol = findHeaderCol(colHeaders, t =>
+      headerHas(t, 'total') &&
+      (headerHas(t, 'b+c+d') || (headerHas(t, '(e)') && headerHas(t, 'total'))) &&
+      !headerHas(t, 'higher') && !headerHas(t, 'cumulative')
+    );
+  }
+
+  if (guaranteedCol < 0 && kind === 'sv' && colHeaders.length >= 5) guaranteedCol = 4;
+  if (kind === 'db'){
+    if (gcvCol < 0 && colHeaders.length >= 5) gcvCol = 4;
+    if (guaranteedCol < 0 && colHeaders.length >= 6) guaranteedCol = 5;
+  }
+  const cashCol = cashWdCol >= 0 ? cashWdCol : (colHeaders.length >= 3 ? 2 : -1);
+  const cumCol = cumWdCol >= 0 ? cumWdCol : (colHeaders.length >= 4 ? 3 : -1);
+
+  const zoneEnd = colHeaders.length - 1;
+  const ngStart = Math.max(0, guaranteedCol >= 0 ? guaranteedCol + 1 : (gcvCol >= 0 ? gcvCol + 1 : 0));
+  const ngCols = guaranteedCol >= 0 || totalCol >= 0
+    ? findNonGuarCols(colHeaders, ngStart, totalCol >= 0 ? totalCol : zoneEnd, totalCol)
+    : [];
+
+  const rows = [];
+  dataRows.forEach(r => {
+    const label = cleanText(r[yearCol]);
+    let year = null, age = null;
+    const ageMatch = label.match(/^at\s*age\s*(\d+)/i);
+    if (ageMatch){ age = parseInt(ageMatch[1], 10); }
+    else if (/^\d+$/.test(label)){ year = parseInt(label, 10); }
+    else return;
+
+    if (ageColIdx !== null && ageColIdx !== undefined){
+      const ageTxt = cleanText(r[ageColIdx]);
+      const am = ageTxt.match(/(\d+)/);
+      if (am) age = parseInt(am[1], 10);
+    }
+
+    const guaranteed = guaranteedCol >= 0 ? toNumber(r[guaranteedCol]) : NaN;
+    let ng = 0;
+    ngCols.forEach(c => { const v = toNumber(r[c]); if (!isNaN(v)) ng += v; });
+    const total = totalCol >= 0 ? toNumber(r[totalCol]) : NaN;
+    if (isNaN(guaranteed) && isNaN(total)) return;
+
+    let premium = null;
+    if (premiumColIdx !== null && premiumColIdx !== undefined && premiumColIdx >= 0){
+      const p = toNumber(r[premiumColIdx]);
+      if (!isNaN(p)) premium = p;
+    }
+
+    const cashWithdrawal = cashCol >= 0 ? toNumber(r[cashCol]) : 0;
+    const cumulativeWithdrawal = cumCol >= 0 ? toNumber(r[cumCol]) : 0;
+    const notionalAfterWithdrawal = notionalCol >= 0 ? toNumber(r[notionalCol]) : NaN;
+    const guaranteedCashValue = gcvCol >= 0 ? toNumber(r[gcvCol]) : NaN;
+
+    rows.push({
+      year, age,
+      guaranteed: isNaN(guaranteed) ? 0 : guaranteed,
+      nonGuaranteed: ng,
+      total: isNaN(total) ? (isNaN(guaranteed) ? 0 : guaranteed) : total,
+      premium,
+      cashWithdrawal: isNaN(cashWithdrawal) ? 0 : cashWithdrawal,
+      cumulativeWithdrawal: isNaN(cumulativeWithdrawal) ? 0 : cumulativeWithdrawal,
+      notionalAfterWithdrawal: isNaN(notionalAfterWithdrawal) ? null : notionalAfterWithdrawal,
+      guaranteedCashValue: isNaN(guaranteedCashValue) ? null : guaranteedCashValue
+    });
+  });
+  return rows;
+}
+
+function parRowsToSeries(merged, extraKeys){
+  const s = {
+    years: merged.map(r => r.year),
+    ages: merged.map(r => r.age),
+    guaranteed: merged.map(r => r.guaranteed),
+    nonGuaranteed: merged.map(r => r.nonGuaranteed),
+    total: merged.map(r => r.total),
+    premium: merged.map(r => r.premium !== undefined ? r.premium : null)
+  };
+  (extraKeys || []).forEach(k => { s[k] = merged.map(r => r[k] !== undefined && r[k] !== null ? r[k] : null); });
+  return s;
+}
+
+function overlayPremiumByYear(target, source){
+  if (!target || !source || !source.years || !source.premium) return;
+  const map = new Map();
+  source.years.forEach((y, i) => {
+    const p = source.premium[i];
+    if (y !== null && y !== undefined && p !== null && p !== undefined && !map.has(y)) map.set(y, p);
+  });
+  if (map.size === 0) return;
+  target.premium = target.years.map(y => map.has(y) ? map.get(y) : null);
+}
+
 /* ---------- Extract a PAR-style zone (guaranteed + non-guaranteed(s) + total) ---------- */
 function extractParZone(dataRows, colHeaders, guaranteedCol, zoneEnd, yearCol, ageColIdx, premiumColIdx){
   const totalCol = findTotalCol(colHeaders, guaranteedCol, zoneEnd);
@@ -366,6 +524,97 @@ function extractPrepaymentInfo(docEl, rawText){
   return null;
 }
 
+/* ---------- Dual-basis UL (Guaranteed Basis vs Current Assumed Basis) ----------
+   SunRise-style illustrations print two full annual tables with identical
+   Account/Surrender/Death headers. They must stay separate series — grouping
+   only by column-header signature would merge them. */
+function detectBasisFromText(text){
+  const t = (text || '').toLowerCase();
+  if (!t) return null;
+  if (/illustration\s+summary/.test(t) || (/basic\s+plan/.test(t) && /illustration/.test(t) && t.length < 200)) return 'summary';
+  if (/current\s+assumed/.test(t)) return 'currentAssumed';
+  if (/guaranteed\s+basis/.test(t)) return 'guaranteed';
+  return null;
+}
+function nearestBasisMarker(tableEl){
+  let el = tableEl ? tableEl.previousElementSibling : null;
+  let hops = 0;
+  while (el && hops < 16){
+    hops++;
+    const text = cleanText(el.textContent || '');
+    if (el.tagName === 'TABLE'){
+      const cells = el.querySelectorAll('td,th');
+      if (cells.length > 12) break;
+    }
+    if (text && text.length < 600){
+      const basis = detectBasisFromText(text);
+      if (basis) return basis;
+    }
+    el = el.previousElementSibling;
+  }
+  return null;
+}
+function countFlatMetricCols(colHeaders){
+  let av = 0, sv = 0, db = 0;
+  (colHeaders || []).forEach(h => {
+    const lh = (h || '').toLowerCase();
+    if (lh.includes('account value')) av++;
+    if (lh.includes('surrender value')) sv++;
+    if (lh.includes('death benefit')) db++;
+  });
+  return { av, sv, db };
+}
+function isSideBySideBasisSummary(colHeaders, dataRows, yearCol){
+  const n = countFlatMetricCols(colHeaders);
+  if (n.av < 2 || n.sv < 2) return false;
+  const years = (dataRows || []).map(r => parseInt(cleanText(r[yearCol === undefined ? 0 : yearCol]), 10)).filter(y => y > 0);
+  return new Set(years).size < 8;
+}
+function extractAssumedCreditingRate(rawText){
+  const t = rawText || '';
+  const patterns = [
+    /current\s+assumed(?:\s+basis)?[^%]{0,120}?(\d+(?:\.\d+)?)\s*%/i,
+    /assumed\s+crediting(?:\s+interest)?\s+rate[^%]{0,60}?(\d+(?:\.\d+)?)\s*%/i,
+    /crediting\s+interest\s+rate[^%]{0,60}?(\d+(?:\.\d+)?)\s*%/i
+  ];
+  for (let i = 0; i < patterns.length; i++){
+    const m = t.match(patterns[i]);
+    if (m){
+      const n = parseFloat(m[1]);
+      if (!isNaN(n) && n > 0 && n < 50) return n;
+    }
+  }
+  return null;
+}
+function rowsToYearMap(rows, valueKey){
+  const m = new Map();
+  (rows || []).forEach(r => {
+    if (r.year !== null && r.year !== undefined && !m.has(r.year)) m.set(r.year, r[valueKey]);
+  });
+  return m;
+}
+function premiumYearMap(rows){
+  const m = new Map();
+  (rows || []).forEach(r => {
+    if (r.year !== null && r.premium !== null && r.premium !== undefined && !m.has(r.year)) m.set(r.year, r.premium);
+  });
+  return m;
+}
+function buildFlatAxis(entries){
+  const all = [];
+  entries.forEach(entry => {
+    if (!entry) return;
+    ['av','sv','db'].forEach(k => { if (entry[k] && entry[k].length) all.push(...entry[k]); });
+  });
+  if (!all.length) return { years: [], ages: [] };
+  const source = all;
+  const merged = mergeRows(source.map(r => Object.assign({}, r)), ['value']);
+  return { years: merged.map(r => r.year), ages: merged.map(r => r.age) };
+}
+function seriesFromMap(years, map){
+  return years.map(y => map.has(y) ? map.get(y) : null);
+}
+
 /* ---------- Main parser: given mammoth HTML string, extract SV/DB series ---------- */
 function parseIllustrationHtml(html, rawText){
   const parser = new DOMParser();
@@ -375,22 +624,53 @@ function parseIllustrationHtml(html, rawText){
   // candidate groups keyed by signature -> {kind, rows:[], colHeaders, meta...}
   const svCandidates = {};
   const dbCandidates = {};
-  const flatCandidates = {}; // for UL: {sig: {av:[], sv:[], db:[]}}
+  const svWithdrawalCandidates = {};
+  const dbWithdrawalCandidates = {};
+  const flatCandidates = {}; // for UL: {key: {av:[], sv:[], db:[], basis}}
 
   tables.forEach(tableEl => {
     const { grid, maxCols } = normalizeTable(tableEl);
     if (maxCols < 3 || grid.length < 2) return;
-    const { headerRows, dataRows } = splitHeaderData(grid);
-    if (dataRows.length === 0 || headerRows.length === 0) return;
-    const colHeaders = columnHeaders(headerRows, maxCols);
+    const { headerRows, dataRows: dataRowsRaw } = splitHeaderData(grid);
+    if (dataRowsRaw.length === 0 || headerRows.length === 0) return;
+    let colHeaders = columnHeaders(headerRows, maxCols);
+    let dataRows = dataRowsRaw;
     const fullHeaderLower = colHeaders.join(' ').toLowerCase();
+    const headerBasis = detectBasisFromText(fullHeaderLower);
+    const nearBasis = nearestBasisMarker(tableEl);
+    const tableBasis = headerBasis || nearBasis;
+    const yearCol = 0;
+    if (tableBasis === 'summary' || isSideBySideBasisSummary(colHeaders, dataRows, yearCol)) return;
+    function locateAgeCol(headers){
+      let idx = null;
+      headers.forEach((h, i) => {
+        if (i !== yearCol && /\bage\b/i.test(h) && !/at\s*age/i.test(h)) { if (idx === null) idx = i; }
+      });
+      return idx;
+    }
+
+    // "… AFTER CASH WITHDRAWAL" is a parallel scenario on the same policy — parse
+    // it separately. Other withdrawal-related tables (e.g. "Illustration Under
+    // Withdrawal Arrangement", cash-withdrawal-amount breakdowns) are still skipped.
+    if (isAfterCashWithdrawalHeader(fullHeaderLower)){
+      const collapsed = collapseDuplicateHeaderColumns(colHeaders, dataRows);
+      colHeaders = collapsed.colHeaders;
+      dataRows = collapsed.dataRows;
+      const ageColIdx = locateAgeCol(colHeaders);
+      const premiumColIdx = findPremiumCol(colHeaders, 0, colHeaders.length - 1);
+      const isDb = fullHeaderLower.includes('death benefit');
+      const isSv = fullHeaderLower.includes('surrender value');
+      const kind = (isDb && !isSv) ? 'db' : 'sv';
+      const rows = extractWithdrawalZone(dataRows, colHeaders, kind, yearCol, ageColIdx, premiumColIdx);
+      const sig = headerSignature(colHeaders, [0, colHeaders.length - 1]);
+      const bucket = kind === 'db' ? dbWithdrawalCandidates : svWithdrawalCandidates;
+      if (!bucket[sig]) bucket[sig] = [];
+      bucket[sig].push(...rows);
+      return;
+    }
     if (fullHeaderLower.includes('withdrawal')) return; // skip supplementary "under withdrawal arrangement" tables — different scenario, not the base plan
 
-    const yearCol = 0;
-    let ageColIdx = null;
-    colHeaders.forEach((h, idx) => {
-      if (idx !== yearCol && /\bage\b/i.test(h) && !/at\s*age/i.test(h)) { if (ageColIdx === null) ageColIdx = idx; }
-    });
+    const ageColIdx = locateAgeCol(colHeaders);
     const premiumColIdx = findPremiumCol(colHeaders, 0, maxCols - 1);
 
     const guarCols = findGuaranteedCols(colHeaders);
@@ -431,10 +711,12 @@ function parseIllustrationHtml(html, rawText){
       });
       if (svCol !== -1 || dbCol !== -1 || avCol !== -1){
         const sig = headerSignature(colHeaders, [0, maxCols - 1]);
-        if (!flatCandidates[sig]) flatCandidates[sig] = { av: [], sv: [], db: [] };
-        if (avCol !== -1) flatCandidates[sig].av.push(...extractFlatSeries(dataRows, avCol, yearCol, ageColIdx, premiumColIdx));
-        if (svCol !== -1) flatCandidates[sig].sv.push(...extractFlatSeries(dataRows, svCol, yearCol, ageColIdx, premiumColIdx));
-        if (dbCol !== -1) flatCandidates[sig].db.push(...extractFlatSeries(dataRows, dbCol, yearCol, ageColIdx, premiumColIdx));
+        const basis = (tableBasis === 'guaranteed' || tableBasis === 'currentAssumed') ? tableBasis : 'single';
+        const key = basis + '||' + sig;
+        if (!flatCandidates[key]) flatCandidates[key] = { av: [], sv: [], db: [], basis };
+        if (avCol !== -1) flatCandidates[key].av.push(...extractFlatSeries(dataRows, avCol, yearCol, ageColIdx, premiumColIdx));
+        if (svCol !== -1) flatCandidates[key].sv.push(...extractFlatSeries(dataRows, svCol, yearCol, ageColIdx, premiumColIdx));
+        if (dbCol !== -1) flatCandidates[key].db.push(...extractFlatSeries(dataRows, dbCol, yearCol, ageColIdx, premiumColIdx));
       }
     }
   });
@@ -456,15 +738,39 @@ function parseIllustrationHtml(html, rawText){
     });
     return best;
   }
+  function pickBestFlatByBasis(candidates, basis){
+    const subset = {};
+    Object.keys(candidates).forEach(k => {
+      if (candidates[k].basis === basis) subset[k] = candidates[k];
+    });
+    return pickBestFlat(subset);
+  }
 
   const svRowsRaw = pickBest(svCandidates);
   const dbRowsRaw = pickBest(dbCandidates);
-  const flatBest = pickBestFlat(flatCandidates);
+  const svWdRowsRaw = pickBest(svWithdrawalCandidates);
+  const dbWdRowsRaw = pickBest(dbWithdrawalCandidates);
+  const flatGuaranteed = pickBestFlatByBasis(flatCandidates, 'guaranteed');
+  const flatAssumed = pickBestFlatByBasis(flatCandidates, 'currentAssumed');
+  const flatSingle = pickBestFlatByBasis(flatCandidates, 'single');
+  const isDualFlat = !!(flatGuaranteed && flatAssumed &&
+    (flatGuaranteed.sv.length + flatGuaranteed.av.length) > 0 &&
+    (flatAssumed.sv.length + flatAssumed.av.length) > 0);
+  const flatBest = isDualFlat ? flatAssumed : (flatSingle || flatAssumed || flatGuaranteed);
 
   const meta = extractMetadata(rawText, doc);
   const prepayment = extractPrepaymentInfo(doc, rawText);
 
-  const result = { type: null, meta, sv: null, db: null, prepayment };
+  const result = { type: null, meta, sv: null, db: null, svWithdrawal: null, dbWithdrawal: null, prepayment, dualBasis: false, assumedCreditingRate: null };
+
+  const extraWdKeys = ['cashWithdrawal', 'cumulativeWithdrawal', 'notionalAfterWithdrawal'];
+  const extraDbWdKeys = extraWdKeys.concat(['guaranteedCashValue']);
+
+  function buildWithdrawalSeries(rowsRaw, extraKeys){
+    if (!rowsRaw || !rowsRaw.length) return null;
+    const merged = mergeRows(rowsRaw, ['guaranteed', 'nonGuaranteed', 'total', 'cashWithdrawal', 'cumulativeWithdrawal']);
+    return parRowsToSeries(merged, extraKeys);
+  }
 
   const hasParSv = svRowsRaw && svRowsRaw.length > 0;
   const hasParDb = dbRowsRaw && dbRowsRaw.length > 0;
@@ -495,41 +801,49 @@ function parseIllustrationHtml(html, rawText){
     }
   } else if (hasFlat){
     result.type = 'flat';
-    const allRows = [].concat(flatBest.av, flatBest.sv, flatBest.db);
-    // build a unified year axis from whichever series has the most points
-    const source = flatBest.sv.length >= flatBest.av.length && flatBest.sv.length >= flatBest.db.length ? flatBest.sv
-                  : flatBest.av.length >= flatBest.db.length ? flatBest.av : flatBest.db;
-    const merged = mergeRows(source.map(r=>Object.assign({}, r)), ['value']);
-    const years = merged.map(r=>r.year);
-    function lookup(rows, year){
-      const hit = rows.find(r => r.year === year || (r.year===null && false));
-      return hit ? hit.value : null;
-    }
-    // Build maps by year for av/sv/db independently (in case they came from same rows, which they do — same yearCol)
-    function toMap(rows){
-      const m = new Map();
-      rows.forEach(r => { if (r.year !== null && !m.has(r.year)) m.set(r.year, r.value); });
-      return m;
-    }
-    function premMap(rows){
-      const m = new Map();
-      rows.forEach(r => { if (r.year !== null && r.premium !== null && r.premium !== undefined && !m.has(r.year)) m.set(r.year, r.premium); });
-      return m;
-    }
-    const avMap = toMap(flatBest.av), svMap = toMap(flatBest.sv), dbMap = toMap(flatBest.db);
-    const pMap = premMap(flatBest.sv.length ? flatBest.sv : (flatBest.av.length ? flatBest.av : flatBest.db));
+    const { years, ages } = buildFlatAxis(isDualFlat ? [flatGuaranteed, flatAssumed] : [flatBest]);
+    const assumedSrc = isDualFlat ? flatAssumed : flatBest;
+    const avMap = rowsToYearMap(assumedSrc.av, 'value');
+    const svMap = rowsToYearMap(assumedSrc.sv, 'value');
+    const dbMap = rowsToYearMap(assumedSrc.db, 'value');
+    const pMap = premiumYearMap(assumedSrc.sv.length ? assumedSrc.sv : (assumedSrc.av.length ? assumedSrc.av : assumedSrc.db));
     result.sv = {
-      years, ages: merged.map(r=>r.age),
-      accountValue: years.map(y => avMap.has(y) ? avMap.get(y) : null),
-      surrenderValue: years.map(y => svMap.has(y) ? svMap.get(y) : null),
-      premium: years.map(y => pMap.has(y) ? pMap.get(y) : null)
+      years, ages,
+      accountValue: seriesFromMap(years, avMap),
+      surrenderValue: seriesFromMap(years, svMap),
+      premium: seriesFromMap(years, pMap)
     };
     result.db = {
-      years, ages: merged.map(r=>r.age),
-      deathBenefit: years.map(y => dbMap.has(y) ? dbMap.get(y) : null),
-      premium: years.map(y => pMap.has(y) ? pMap.get(y) : null)
+      years, ages,
+      deathBenefit: seriesFromMap(years, dbMap),
+      premium: seriesFromMap(years, pMap)
     };
+    if (isDualFlat){
+      result.dualBasis = true;
+      result.assumedCreditingRate = extractAssumedCreditingRate(rawText);
+      const gAv = rowsToYearMap(flatGuaranteed.av, 'value');
+      const gSv = rowsToYearMap(flatGuaranteed.sv, 'value');
+      const gDb = rowsToYearMap(flatGuaranteed.db, 'value');
+      const aAv = rowsToYearMap(flatAssumed.av, 'value');
+      const aSv = rowsToYearMap(flatAssumed.sv, 'value');
+      const aDb = rowsToYearMap(flatAssumed.db, 'value');
+      result.sv.guaranteed = {
+        accountValue: seriesFromMap(years, gAv),
+        surrenderValue: seriesFromMap(years, gSv)
+      };
+      result.sv.currentAssumed = {
+        accountValue: seriesFromMap(years, aAv),
+        surrenderValue: seriesFromMap(years, aSv)
+      };
+      result.db.guaranteed = { deathBenefit: seriesFromMap(years, gDb) };
+      result.db.currentAssumed = { deathBenefit: seriesFromMap(years, aDb) };
+    }
   }
+
+  result.svWithdrawal = buildWithdrawalSeries(svWdRowsRaw, extraWdKeys);
+  result.dbWithdrawal = buildWithdrawalSeries(dbWdRowsRaw, extraDbWdKeys);
+  if (result.svWithdrawal) overlayPremiumByYear(result.svWithdrawal, result.sv);
+  if (result.dbWithdrawal) overlayPremiumByYear(result.dbWithdrawal, result.sv || result.db);
 
   return result;
 }
@@ -580,7 +894,7 @@ function inferPremiumSchedule(years, premiums){
 
 /* Compute XIRR at each year of a merged SV series. Returns array aligned to `years`,
    with null where XIRR could not be computed. */
-function computeXirrSeries(years, totalValues, premiums){
+function computeXirrSeries(years, totalValues, premiums, withdrawals){
   const sched = inferPremiumSchedule(years, premiums);
   if (!sched) return years.map(() => null);
   const { P, term } = sched;
@@ -590,6 +904,13 @@ function computeXirrSeries(years, totalValues, premiums){
     const npay = Math.min(y, term);
     const cashflows = [];
     for (let t = 0; t < npay; t++) cashflows.push({ t, cf: -P });
+    if (withdrawals){
+      years.forEach((wy, wi) => {
+        if (wy === null || wy === undefined || wy > y) return;
+        const w = withdrawals[wi];
+        if (w !== null && w !== undefined && !isNaN(w) && w > 0) cashflows.push({ t: wy, cf: w });
+      });
+    }
     cashflows.push({ t: y, cf: v });
     const r = xirrSolve(cashflows);
     return r === null ? null : r;
@@ -686,8 +1007,113 @@ function nearestYearIndex(years, targetYear){
 const state = {
   metric: 'sv', product: 'all', currency: 'usd', rate: 32.50,
   hidden: new Set(), fontScale: 1, viewMode: 'compare', xirrProduct: 'p1', xAxisRange: 40,
-  products: { p1: null, p2: null } // each: {label, type, sv, db} once parsed
+  scenario: { p1: 'base', p2: 'base' },
+  showPrepay: true,
+  products: { p1: null, p2: null } // each: {label, type, sv, db, svWithdrawal, dbWithdrawal} once parsed
 };
+
+function productHasWithdrawal(p){
+  return !!(p && (p.svWithdrawal || p.dbWithdrawal));
+}
+function productHasPrepayment(p){
+  return !!(p && p.prepayment && p.prepayment.lumpSum);
+}
+function showPrepayCompare(){
+  return !!state.showPrepay;
+}
+function hasVisibleDualBasis(){
+  return relevantProductKeys().some(pk => state.products[pk] && state.products[pk].dualBasis);
+}
+function visibleAssumedCreditingRate(){
+  const keys = relevantProductKeys();
+  for (let i = 0; i < keys.length; i++){
+    const p = state.products[keys[i]];
+    if (p && p.dualBasis && p.assumedCreditingRate != null) return p.assumedCreditingRate;
+  }
+  return null;
+}
+function dualBasisDisclaimer(longForm){
+  const rate = visibleAssumedCreditingRate();
+  const rateTxt = (rate != null) ? rate.toFixed(2) + '% ต่อปี' : 'ที่ระบุในเอกสาร';
+  if (longForm){
+    return 'เส้น Guaranteed ของ Surrender Value / Death Benefit คือตัวการันตีแยก (เช่น CGR) ที่เอกสารพิมพ์ไว้ตรง ๆ ไม่ได้มาจากการเอา Account Value ที่ credit อัตราขั้นต่ำมาหักค่าใช้จ่าย ส่วน Current Assumed ใช้สมมติฐานอัตราเครดิตคงที่ (' + rateTxt + ') ที่บริษัทเลือกมาแสดง ซึ่งอาจต่างจากผลจริงของกรมธรรม์แบบ UL/IUL';
+  }
+  return 'Guaranteed = การันตี CGR (ไม่ใช่ AV ที่ credit 0%) · Current Assumed = สมมติฐาน ' + rateTxt;
+}
+function relevantProductKeys(){
+  if (state.viewMode === 'xirr') return [state.xirrProduct];
+  if (state.product === 'all') return ['p1','p2'].filter(pk => state.products[pk]);
+  return [state.product];
+}
+function resolveProductView(pk){
+  const p = state.products[pk];
+  if (!p) return null;
+  const useWd = (state.scenario[pk] === 'withdrawal') && productHasWithdrawal(p);
+  return {
+    label: p.label, type: p.type, prepayment: p.prepayment,
+    sv: (useWd && p.svWithdrawal) ? p.svWithdrawal : p.sv,
+    db: (useWd && p.dbWithdrawal) ? p.dbWithdrawal : p.db,
+    svWithdrawal: p.svWithdrawal, dbWithdrawal: p.dbWithdrawal,
+    scenario: useWd ? 'withdrawal' : 'base',
+    dualBasis: !!p.dualBasis,
+    assumedCreditingRate: p.assumedCreditingRate
+  };
+}
+function lookupSeriesValue(series, key, year){
+  if (!series || !series.years || !series[key]) return null;
+  const idx = series.years.indexOf(year);
+  if (idx === -1) return null;
+  const v = series[key][idx];
+  return (v === undefined) ? null : v;
+}
+
+function productPremiumTotals(view){
+  let annual = null;
+  const data = getSvSeriesForXirr(view);
+  if (data){
+    const sched = inferPremiumSchedule(data.years, data.premiums);
+    if (sched) annual = sched.P * sched.term;
+  }
+  const prepay = (view && view.prepayment && view.prepayment.lumpSum) ? view.prepayment.lumpSum : null;
+  return { annual, prepay };
+}
+
+const NOTIONAL_SOFT_USD = 10000;
+const NOTIONAL_HARD_USD = 8000;
+const GHOST_LINE_COLOR = 'rgba(120,120,120,0.38)';
+
+function findFirstBelow(years, valuesUsd, thresholdUsd){
+  for (let i = 0; i < years.length; i++){
+    const v = valuesUsd[i];
+    if (v !== null && v !== undefined && !isNaN(v) && v < thresholdUsd){
+      return { year: years[i], index: i, value: v };
+    }
+  }
+  return null;
+}
+function getNotionalUsdAligned(view, years){
+  if (!view || view.scenario !== 'withdrawal') return null;
+  const nSrc = (view.db && view.db.notionalAfterWithdrawal) ? view.db
+             : (view.sv && view.sv.notionalAfterWithdrawal) ? view.sv : null;
+  if (!nSrc || !nSrc.notionalAfterWithdrawal) return null;
+  return alignToYears(years, nSrc.years, nSrc.ages, nSrc.notionalAfterWithdrawal);
+}
+function collectNotionalAlerts(years){
+  const alerts = [];
+  ['p1','p2'].forEach(pk => {
+    if (state.product !== 'all' && state.product !== pk) return;
+    const view = resolveProductView(pk);
+    const aligned = getNotionalUsdAligned(view, years);
+    if (!aligned || !aligned.some(v => v !== null && v !== undefined)) return;
+    alerts.push({
+      pk,
+      aligned,
+      crossSoft: findFirstBelow(years, aligned, NOTIONAL_SOFT_USD),
+      crossHard: findFirstBelow(years, aligned, NOTIONAL_HARD_USD)
+    });
+  });
+  return alerts;
+}
 
 const PALETTE = {
   p1: { guaranteed:'#8a5a00', nonGuaranteed:'#e8b96a', total:'#b8860b',
@@ -697,9 +1123,21 @@ const PALETTE = {
         dbGuaranteed:'#1b3a5c', dbNonGuaranteed:'#9ecbef', dbTotal:'#2f6fae',
         accountValue:'#0b3d91', surrenderValue:'#3d78c9', deathBenefit:'#7fb3e0' }
 };
+/* Dual-basis UL lines: split Guaranteed vs Current Assumed by hue (not dash).
+   Dash is reserved for Prepayment vs annual pay. */
+const DUAL_BASIS_LINE = {
+  p1: { guaranteed:'#2c5f8a', assumed:'#c8962c' },
+  p2: { guaranteed:'#4a8bb5', assumed:'#d4a24a' }
+};
 
 let chart = null;
+let wdChart = null;
 let datasetConfigs = [];
+
+const SHARED_Y_AXIS_WIDTH = 86;
+function pinSharedYAxis(scale){
+  scale.width = SHARED_Y_AXIS_WIDTH;
+}
 
 /* Custom tooltip positioner: keep the tooltip pinned near the top of the chart area
    (above the data) instead of hovering right on top of the point, so it never
@@ -749,7 +1187,7 @@ const premiumLabelPlugin = {
     const { ctx, chartArea } = c;
     const entries = [];
     c.data.datasets.forEach((ds, i) => {
-      if (!ds.isPremiumRef) return;
+    if (!ds.isPremiumRef && !ds.isNotionalRef) return;
       const meta = c.getDatasetMeta(i);
       if (!meta.visible) return;
       let pt = null, val = null;
@@ -757,13 +1195,19 @@ const premiumLabelPlugin = {
         if (ds.data[j] !== null && ds.data[j] !== undefined && meta.data[j]){ pt = meta.data[j]; val = ds.data[j]; break; }
       }
       if (!pt) return;
-      const below = /_premium_prepay$/.test(ds.id);
+      const below = /_premium_prepay$/.test(ds.id) || ds.isNotionalRef;
+      let text = `${ds.label}: ${formatMoney(val)}`;
+      if (ds.isNotionalRef){
+        const usd = ccyMultiplier() ? val / ccyMultiplier() : val;
+        if (usd < NOTIONAL_HARD_USD) text += '  ⚠ ต่ำกว่า ' + formatMoney(NOTIONAL_HARD_USD * ccyMultiplier());
+        else if (usd < NOTIONAL_SOFT_USD) text += '  ⓘ ต่ำกว่า ' + formatMoney(NOTIONAL_SOFT_USD * ccyMultiplier());
+      }
       entries.push({
         x: Math.min(pt.x, chartArea.right - 4),
         y: below ? pt.y + 8 : pt.y - 8,
         below,
         color: ds.borderColor,
-        text: `${ds.label}: ${formatMoney(val)}`
+        text
       });
     });
     if (!entries.length) return;
@@ -777,6 +1221,74 @@ const premiumLabelPlugin = {
       ctx.fillText(e.text, e.x, y);
     });
     ctx.restore();
+  }
+};
+
+function renderDomNotionalWarns(containerId, markers){
+  const container = document.getElementById(containerId);
+  if (!container) return;
+  container.querySelectorAll('.chart-notional-warn').forEach(el => el.remove());
+  markers.forEach(m => {
+    const div = document.createElement('div');
+    div.className = 'chart-notional-warn';
+    div.style.left = m.x + 'px';
+    div.style.top = m.y + 'px';
+    div.innerHTML =
+      `<div class="warn-mark"></div>` +
+      `<div class="warn-label">${m.label}</div>`;
+    container.appendChild(div);
+  });
+}
+
+/* Amber warning band + crossing marker on the Death Benefit chart once Notional Amount
+   After Cash Withdrawal falls below USD 8,000. Distinct from the red/green breakeven flags. */
+const notionalAlertPlugin = {
+  id: 'notionalAlertPlugin',
+  beforeDatasetsDraw(c){
+    const alerts = c._notionalAlerts;
+    if (state.metric !== 'db' || !alerts || !alerts.length) return;
+    const xScale = c.scales.x;
+    const { ctx, chartArea } = c;
+    ctx.save();
+    alerts.forEach(a => {
+      if (!a.crossHard) return;
+      const x = xScale.getPixelForValue(a.crossHard.index);
+      const left = Math.max(chartArea.left, x);
+      ctx.fillStyle = 'rgba(232, 93, 4, 0.10)';
+      ctx.fillRect(left, chartArea.top, Math.max(0, chartArea.right - left), chartArea.bottom - chartArea.top);
+      ctx.strokeStyle = 'rgba(232, 93, 4, 0.55)';
+      ctx.lineWidth = 1.5;
+      ctx.setLineDash([5, 4]);
+      ctx.beginPath();
+      ctx.moveTo(left, chartArea.top);
+      ctx.lineTo(left, chartArea.bottom);
+      ctx.stroke();
+      ctx.setLineDash([]);
+    });
+    ctx.restore();
+  },
+  afterDatasetsDraw(c){
+    const alerts = c._notionalAlerts;
+    if (state.metric !== 'db' || !alerts || !alerts.length){
+      renderDomNotionalWarns('chartHolder', []);
+      return;
+    }
+    const markers = [];
+    alerts.forEach(a => {
+      if (!a.crossHard) return;
+      const cfgIdx = datasetConfigs.findIndex(cfg => cfg.id === a.pk + '_db_notional');
+      if (cfgIdx === -1) return;
+      const meta = c.getDatasetMeta(cfgIdx);
+      if (!meta.visible) return;
+      const pt = meta.data[a.crossHard.index];
+      if (!pt) return;
+      const thresh = formatMoney(NOTIONAL_HARD_USD * ccyMultiplier());
+      markers.push({
+        x: pt.x, y: pt.y,
+        label: `Notional < ${thresh} · ปีที่ ${a.crossHard.year}`
+      });
+    });
+    renderDomNotionalWarns('chartHolder', markers);
   }
 };
 
@@ -810,7 +1322,7 @@ function findMainLineIndex(c, pk, metric){
   const candidates = [];
   c.data.datasets.forEach((d, i) => {
     const cfg = datasetConfigs[i];
-    if (!cfg || cfg.product !== pk || cfg.metric !== metric || cfg.type !== 'line' || cfg.isPremiumRef) return;
+    if (!cfg || cfg.product !== pk || cfg.metric !== metric || cfg.type !== 'line' || cfg.isPremiumRef || cfg.isNotionalRef || cfg.isGhostRef) return;
     candidates.push(i);
   });
   if (!candidates.length) return -1;
@@ -880,8 +1392,10 @@ const xirrBreakevenPlugin = {
     const years = c._years;
     const info = c._breakevenInfo;
     if (!years || !info) { renderDomFlags('xirrChartHolder', []); return; }
-    const metaNormal = c.getDatasetMeta(0);
-    const metaPrepay = c.data.datasets.length > 1 ? c.getDatasetMeta(1) : null;
+    const idxNormal = c.data.datasets.findIndex(d => d.isXirrNormal);
+    const idxPrepay = c.data.datasets.findIndex(d => d.isXirrPrepay);
+    const metaNormal = idxNormal >= 0 ? c.getDatasetMeta(idxNormal) : null;
+    const metaPrepay = idxPrepay >= 0 ? c.getDatasetMeta(idxPrepay) : null;
     const flags = [];
     function plant(yearVal, meta, color, tier){
       if (yearVal === null || yearVal === undefined || !meta || !meta.visible) return;
@@ -915,6 +1429,34 @@ function formatMoney(value){
   if (state.currency === 'thb') return thaiCompactNumber(value) + ' บาท';
   return 'USD ' + fmtNumber(value);
 }
+function moneyHtml(value){
+  return `<span class="amt">${formatMoney(value)}</span>`;
+}
+/* Tooltip-only: large digits, smaller unit/suffix (USD / ล้าน บาท / แสน บาท / บาท). */
+function formatMoneyTooltip(value){
+  if (value === null || value === undefined || isNaN(value)) return '—';
+  if (state.currency === 'thb'){
+    const abs = Math.abs(value);
+    if (abs >= 1000000){
+      const n = (Math.ceil((value / 1000000) * 100) / 100).toFixed(2);
+      return `<span class="tt-num">${n}</span><span class="tt-unit"> ล้าน บาท</span>`;
+    }
+    if (abs >= 100000){
+      const n = (Math.ceil((value / 100000) * 100) / 100).toFixed(2);
+      return `<span class="tt-num">${n}</span><span class="tt-unit"> แสน บาท</span>`;
+    }
+    return `<span class="tt-num">${fmtNumber(value)}</span><span class="tt-unit"> บาท</span>`;
+  }
+  return `<span class="tt-unit">USD </span><span class="tt-num">${fmtNumber(value)}</span>`;
+}
+function formatPctTooltip(pct){
+  if (pct === null || pct === undefined || isNaN(pct)) return '—';
+  return `<span class="tt-num">${(pct * 100).toFixed(2)}</span><span class="tt-unit">%</span>`;
+}
+function formatPayoutTooltip(acc, premium){
+  if (acc === null || acc === undefined || acc <= 0 || !premium) return '—';
+  return `<span class="tt-num">${(acc / premium).toFixed(2)}</span><span class="tt-unit">x</span>`;
+}
 /* Compact variant for axis ticks — same tiers, no trailing currency word to save space. */
 function formatMoneyAxis(value){
   if (state.currency === 'thb') return thaiCompactNumber(value);
@@ -929,10 +1471,17 @@ function formatMoneyTable(value){
 
 /* Wraps a percentage string in a colored span — green for positive/zero XIRR, red for
    negative — used anywhere a raw XIRR % is shown as HTML (KPI cards). */
-function xirrColorSpan(pct, text){
-  if (pct === null || pct === undefined || isNaN(pct)) return text;
-  const color = pct >= 0 ? 'var(--ok)' : 'var(--err)';
-  return `<span style="color:${color};">${text}</span>`;
+function xirrColorSpan(pct, text, opts){
+  if (pct === null || pct === undefined || isNaN(pct)){
+    const cls = opts && opts.cls ? ` class="${opts.cls}"` : '';
+    return `<span${cls}>${text}</span>`;
+  }
+  const bright = opts && opts.bright;
+  const color = pct >= 0
+    ? (bright ? 'var(--ok-bright)' : 'var(--ok)')
+    : (bright ? 'var(--err-bright)' : 'var(--err)');
+  const cls = opts && opts.cls ? ` class="${opts.cls}"` : '';
+  return `<span${cls} style="color:${color};">${text}</span>`;
 }
 
 /* Premium reference lines (Total Premium Paid, normal + prepayment) are now built as
@@ -954,60 +1503,229 @@ function resolveTooltipColor(dataset, dataIndex, chartInstance){
   return bg;
 }
 
-/* Custom HTML tooltip for the compare-view chart — lets us color XIRR figures red/green and
-   every value figure light-blue, which a canvas-rendered Chart.js tooltip can't do per-substring. */
-function renderCompareTooltip(context, years, ages){
-  const { chart, tooltip } = context;
-  let el = chart.canvas.parentNode.querySelector('.custom-tooltip');
+function setCompareHover(idx){
+  let changed = false;
+  if (chart && chart._hoveredIdx !== idx){ chart._hoveredIdx = idx; changed = true; }
+  if (wdChart && wdChart._hoveredIdx !== idx){ wdChart._hoveredIdx = idx; changed = true; }
+  if (changed){
+    if (chart) chart.update('none');
+    if (wdChart) wdChart.update('none');
+  }
+}
+
+function getCompareTooltipEl(){
+  const stack = document.getElementById('chartStack');
+  if (!stack) return null;
+  let el = stack.querySelector(':scope > .custom-tooltip');
   if (!el){
     el = document.createElement('div');
     el.className = 'custom-tooltip';
-    chart.canvas.parentNode.appendChild(el);
+    stack.appendChild(el);
   }
-  if (tooltip.opacity === 0 || !tooltip.dataPoints || !tooltip.dataPoints.length){
-    el.style.opacity = 0;
-    return;
-  }
-  const idx = tooltip.dataPoints[0].dataIndex;
-  const y = years[idx], a = ages[idx];
+  return el;
+}
 
+function hideCompareTooltip(){
+  const el = getCompareTooltipEl();
+  if (el) el.style.opacity = 0;
+}
+
+function placeCompareTooltip(caretX, sourceChart){
+  const el = getCompareTooltipEl();
+  const stack = document.getElementById('chartStack');
+  if (!el || !stack || !sourceChart) return;
+  const card = document.getElementById('compareView') || stack;
+  el.style.opacity = '1';
+  const stackRect = stack.getBoundingClientRect();
+  const canvasRect = sourceChart.canvas.getBoundingClientRect();
+  const cardRect = card.getBoundingClientRect();
+  const w = el.offsetWidth;
+  const h = el.offsetHeight;
+  const pad = 8;
+  const minLeft = Math.max(pad, cardRect.left - stackRect.left + pad, pad);
+  const maxRight = Math.min(
+    stackRect.width - pad,
+    cardRect.right - stackRect.left - pad,
+    window.innerWidth - stackRect.left - pad
+  );
+  const offsetX = canvasRect.left - stackRect.left;
+  let left = offsetX + caretX - w / 2;
+  if (left + w > maxRight) left = maxRight - w;
+  if (left < minLeft) left = minLeft;
+  let top = 6;
+  const maxBottom = Math.min(
+    window.innerHeight - stackRect.top - pad,
+    cardRect.bottom - stackRect.top - pad
+  );
+  if (top + h > maxBottom) top = Math.max(pad, maxBottom - h);
+  el.style.left = left + 'px';
+  el.style.top = top + 'px';
+}
+
+function tooltipSeriesLabel(ds, cfg){
+  const raw = ds.label || '';
+  const m = raw.match(/^(\[[^\]]+\]\s*)?(.*)$/);
+  const prefix = (m && m[1]) || '';
+  const core = ((m && m[2]) || raw).trim();
+  if (state.currency !== 'thb') return raw;
+  if (ds.isGhostRef || /\(No Withdrawal\)/.test(core)){
+    return prefix + 'มูลค่าเวนคืน สุทธิ (สะสม = ไม่ถอน) เมื่อสิ้นปี';
+  }
+  if (core === 'Total Surrender Value'){
+    const view = cfg && cfg.product ? resolveProductView(cfg.product) : null;
+    return prefix + (view && view.scenario === 'withdrawal'
+      ? 'มูลค่าเวนคืน สุทธิ (ถอนใช้บางส่วน) เมื่อสิ้นปี'
+      : 'มูลค่าเวนคืน สุทธิ เมื่อสิ้นปี');
+  }
+  if (core === 'Surrender Value: Guaranteed') return prefix + 'มูลค่าเวนคืน ส่วนการันตี เมื่อสิ้นปี';
+  if (core === 'Surrender Value: Non-Guaranteed') return prefix + 'มูลค่าเวนคืน ส่วนลงทุน เมื่อสิ้นปี';
+  if (core === 'Surrender Value (Guaranteed)') return prefix + 'มูลค่าเวนคืน (ฐานการันตี) เมื่อสิ้นปี';
+  if (core === 'Surrender Value (Current Assumed)') return prefix + 'มูลค่าเวนคืน (ฐานสมมติปัจจุบัน) เมื่อสิ้นปี';
+  if (core === 'Death Benefit (Guaranteed)') return prefix + 'เงินคุ้มครองชีวิต (ฐานการันตี)';
+  if (core === 'Death Benefit (Current Assumed)') return prefix + 'เงินคุ้มครองชีวิต (ฐานสมมติปัจจุบัน)';
+  if (core === 'Account Value') return prefix + 'มูลค่าบัญชี';
+  return raw;
+}
+
+function tooltipWdLabel(en, th){
+  return state.currency === 'thb' ? th : en;
+}
+
+function tooltipXirrLabel(showPrepay){
+  if (state.currency === 'thb'){
+    return showPrepay
+      ? 'อัตรามูลค่าเติบโต "ทบต้นตามเวลา" (จ่ายปกติ) / (จ่ายล่วงหน้า)'
+      : 'อัตรามูลค่าเติบโต "ทบต้นตามเวลา" (จ่ายปกติ)';
+  }
+  return showPrepay ? 'XIRR (ปกติ) / XIRR (Prepayment)' : 'XIRR (ปกติ)';
+}
+
+function surrenderValueAtYear(view, y){
+  const s = view && view.sv;
+  if (!s) return null;
+  if (view.type === 'par') return lookupSeriesValue(s, 'total', y);
+  return lookupSeriesValue(s, 'surrenderValue', y) || lookupSeriesValue(s, 'accountValue', y);
+}
+
+function payoutRatioRow(prefix, label, ratioN, showPrepayPair, ratioP){
+  if (showPrepayPair){
+    return `<div class="tt-ratio-row"><span class="tt-lbl">${prefix}${label}</span><span class="tt-payout">${ratioN}</span><span class="tt-mode">ปกติ</span><span class="tt-payout">${ratioP}</span><span class="tt-mode">Prepay</span></div>`;
+  }
+  return `<div class="tt-ratio-row"><span class="tt-lbl">${prefix}${label}</span><span class="tt-payout">${ratioN}</span></div>`;
+}
+
+function buildCompareTooltipHtml(idx, years, ages){
+  if (!chart || idx === null || idx === undefined || !years) return '';
+  const y = years[idx], a = ages ? ages[idx] : null;
   let html = `<div class="tt-title">Year ${y}${a!==null&&a!==undefined?' · อายุ '+a:''}</div>`;
-  tooltip.dataPoints.forEach(dp => {
-    const ds = dp.dataset;
-    if (ds.isPremiumRef) return;
+  chart.data.datasets.forEach((ds, i) => {
+    if (!chart.isDatasetVisible(i)) return;
+    if (ds.isPremiumRef || ds.isNotionalRef) return;
+    const raw = ds.data[idx];
+    if (raw === null || raw === undefined) return;
     const color = resolveTooltipColor(ds, idx, chart);
     const swatchCls = ds.type === 'line' ? 'tt-swatch tt-line' : 'tt-swatch';
-    html += `<div class="tt-row"><span class="${swatchCls}" style="background:${color}"></span>${ds.label}: <span class="tt-value">${formatMoney(dp.raw)}</span></div>`;
+    html += `<div class="tt-row"><span class="${swatchCls}" style="background:${color}"></span><span class="tt-lbl">${tooltipSeriesLabel(ds, datasetConfigs[i])}</span><span class="tt-value">${formatMoneyTooltip(raw)}</span></div>`;
   });
 
   if (state.metric === 'sv'){
     const multi = !!(state.products.p1 && state.products.p2);
-    const footerLines = [];
+    const xirrRows = [];
     Object.keys(xirrLookupCompare).forEach(pk => {
       if (state.product !== 'all' && state.product !== pk) return;
       const entry = xirrLookupCompare[pk];
       const xv = entry.xirr[idx];
       const xp = entry.xirrPrepay ? entry.xirrPrepay[idx] : null;
       const prefix = multi ? `[${pk.toUpperCase()}] ` : '';
-      let line = `${prefix}XIRR (ปกติ): ${xirrColorSpan(xv, xv===null||xv===undefined?'—':(xv*100).toFixed(2)+'%')}`;
-      if (entry.xirrPrepay) line += ` | Prepayment: ${xirrColorSpan(xp, xp===null||xp===undefined?'—':(xp*100).toFixed(2)+'%')}`;
-      footerLines.push(line);
+      const xvHtml = xirrColorSpan(xv, formatPctTooltip(xv), { bright:true, cls:'tt-value' });
+      const showXp = showPrepayCompare() && !!entry.xirrPrepay;
+      if (showXp){
+        const xpHtml = xirrColorSpan(xp, formatPctTooltip(xp), { bright:true, cls:'tt-value' });
+        xirrRows.push(`<div class="tt-row"><span class="tt-lbl">${prefix}${tooltipXirrLabel(true)}</span><span class="tt-xirr-pair">${xvHtml}<span class="tt-mode">/</span>${xpHtml}</span></div>`);
+      } else {
+        xirrRows.push(`<div class="tt-row"><span class="tt-lbl">${prefix}${tooltipXirrLabel(false)}</span>${xvHtml}</div>`);
+      }
     });
-    if (footerLines.length) html += `<div class="tt-footer">${footerLines.join('<br>')}</div>`;
+    if (xirrRows.length) html += `<div class="tt-footer">${xirrRows.join('')}</div>`;
   }
 
-  el.innerHTML = html;
+  const wdRows = [];
+  const showPrefix = !!(state.products.p1 && state.products.p2);
+  const wdMult = ccyMultiplier();
+  ['p1','p2'].forEach(pk => {
+    if (state.product !== 'all' && state.product !== pk) return;
+    const rawP = state.products[pk];
+    const view = resolveProductView(pk);
+    if (!view) return;
+    const hasWdData = productHasWithdrawal(rawP);
+    const prefix = showPrefix ? `[${pk.toUpperCase()}] ` : '';
+    const src = view.sv || view.db;
+    let acc = 0;
+    if (view.scenario === 'withdrawal' && src){
+      const thisYear = lookupSeriesValue(src, 'cashWithdrawal', y);
+      const cum = lookupSeriesValue(src, 'cumulativeWithdrawal', y);
+      if (cum !== null && cum > 0) acc = cum;
+      if (thisYear !== null){
+        wdRows.push(`<div class="tt-row"><span class="tt-lbl">${prefix}เงินถอนปีนี้</span><span class="tt-value">${formatMoneyTooltip(thisYear * wdMult)}</span></div>`);
+      }
+      const accShown = acc > 0 ? formatMoneyTooltip(acc * wdMult) : '—';
+      wdRows.push(`<div class="tt-row"><span class="tt-lbl">${prefix}${tooltipWdLabel('Acc. Withdrawal', 'มูลค่าเงินถอนสะสม')}</span><span class="tt-value">${accShown}</span></div>`);
+    }
+    if (hasWdData){
+      const prem = productPremiumTotals(view);
+      const showPair = showPrepayCompare() && !!prem.prepay;
+      const ratioRows = [];
+      if (acc > 0){
+        ratioRows.push(payoutRatioRow(
+          prefix,
+          tooltipWdLabel('Payout Ratio (Withdrawal)', 'อัตราการจ่าย (เงินถอน) สะสม ต่อเงินเบี้ยรวม'),
+          formatPayoutTooltip(acc, prem.annual),
+          showPair,
+          formatPayoutTooltip(acc, prem.prepay)
+        ));
+      }
+      const svNow = surrenderValueAtYear(view, y);
+      const rowBNum = (svNow !== null) ? (acc + svNow) : null;
+      const rowBLabel = acc > 0
+        ? tooltipWdLabel('Total Payout Ratio (Withdrawal)', 'อัตราการจ่าย (เงินถอน + เงินสะสม) สะสม ต่อเงินเบี้ยรวม')
+        : tooltipWdLabel('Net Payout Ratio', 'อัตราการจ่าย เวนคืนทั้งหมด สุทธิ ต่อเงินเบี้ยรวม');
+      ratioRows.push(payoutRatioRow(
+        prefix, rowBLabel,
+        formatPayoutTooltip(rowBNum, prem.annual),
+        showPair,
+        formatPayoutTooltip(rowBNum, prem.prepay)
+      ));
+      wdRows.push(`<div class="tt-ratio-grid${showPair ? ' tt-ratio-pair' : ''}">${ratioRows.join('')}</div>`);
+    }
+    if (view.scenario === 'withdrawal' && state.metric === 'db'){
+      const notional = lookupSeriesValue(view.db, 'notionalAfterWithdrawal', y) || lookupSeriesValue(view.sv, 'notionalAfterWithdrawal', y);
+      if (notional !== null){
+        let extra = '';
+        if (notional < NOTIONAL_HARD_USD) extra = ` <span class="tt-warn-hard">⚠ ต่ำกว่า ${formatMoneyTooltip(NOTIONAL_HARD_USD * wdMult)}</span>`;
+        else if (notional < NOTIONAL_SOFT_USD) extra = ` <span class="tt-warn-soft">ⓘ ต่ำกว่า ${formatMoneyTooltip(NOTIONAL_SOFT_USD * wdMult)}</span>`;
+        wdRows.push(`<div class="tt-row"><span class="tt-lbl">${prefix}Notional After Withdrawal</span><span class="tt-value">${formatMoneyTooltip(notional * wdMult)}</span>${extra}</div>`);
+      }
+    }
+  });
+  if (wdRows.length) html += `<div class="tt-footer">${wdRows.join('')}</div>`;
+  return html;
+}
 
-  const chartArea = chart.chartArea;
-  let minY = chartArea.bottom;
-  tooltip.dataPoints.forEach(dp => { if (dp.element && dp.element.y < minY) minY = dp.element.y; });
-  const posY = minY + (chartArea.bottom - minY) * 0.5;
-  let posX = tooltip.caretX;
-  posX = Math.max(chartArea.left + 80, Math.min(chartArea.right - 80, posX));
+function showCompareTooltipAt(idx, caretX, sourceChart, years, ages){
+  if (idx === null || idx === undefined) return;
+  setCompareHover(idx);
+  const el = getCompareTooltipEl();
+  if (!el) return;
+  el.innerHTML = buildCompareTooltipHtml(idx, years, ages);
+  placeCompareTooltip(caretX, sourceChart);
+}
 
-  el.style.left = posX + 'px';
-  el.style.top = posY + 'px';
-  el.style.opacity = 1;
+/* Custom HTML tooltip for the compare-view chart — pinned to the top of the combined
+   chart stack so it never sits on bars, premium labels, or the withdrawal panel. */
+function renderCompareTooltip(context, years, ages){
+  const { chart: c, tooltip } = context;
+  if (tooltip.opacity === 0 || !tooltip.dataPoints || !tooltip.dataPoints.length) return;
+  showCompareTooltipAt(tooltip.dataPoints[0].dataIndex, tooltip.caretX, c, years, ages);
 }
 
 /* Custom HTML tooltip for the XIRR line chart — same red/green coloring for the percentage
@@ -1031,7 +1749,7 @@ function renderXirrTooltip(context, years, ages){
   tooltip.dataPoints.forEach(dp => {
     const ds = dp.dataset;
     const v = dp.raw;
-    const text = (v === null || v === undefined) ? 'ไม่มีข้อมูล' : xirrColorSpan(v/100, (v).toFixed(2) + '% p.a.');
+    const text = (v === null || v === undefined) ? 'ไม่มีข้อมูล' : xirrColorSpan(v/100, (v).toFixed(2) + '% p.a.', { bright:true });
     html += `<div class="tt-row"><span class="tt-swatch tt-line" style="background:${ds.borderColor}"></span>${ds.label}: ${text}</div>`;
   });
   el.innerHTML = html;
@@ -1052,7 +1770,7 @@ function buildYearAgeLabels(){
   // union of all years across both products' sv+db series, sorted
   const yearSet = new Set();
   ['p1','p2'].forEach(pk => {
-    const p = state.products[pk];
+    const p = resolveProductView(pk);
     if (!p) return;
     ['sv','db'].forEach(mk => {
       const s = p[mk];
@@ -1079,7 +1797,7 @@ function buildDatasetConfigs(){
   // derive age labels: prefer whichever product has ages defined
   let ages = years.map(() => null);
   ['p1','p2'].forEach(pk => {
-    const p = state.products[pk];
+    const p = resolveProductView(pk);
     if (!p) return;
     ['sv','db'].forEach(mk => {
       const s = p[mk];
@@ -1099,7 +1817,7 @@ function buildDatasetConfigs(){
   function seriesLabel(pk, core){ return showPrefix ? `[${pk.toUpperCase()}] ${core}` : core; }
 
   ['p1','p2'].forEach(pk => {
-    const p = state.products[pk];
+    const p = resolveProductView(pk);
     if (!p) return;
     const pal = PALETTE[pk];
 
@@ -1110,36 +1828,66 @@ function buildDatasetConfigs(){
         const t = alignToYears(years, p.sv.years, p.sv.ages, p.sv.total);
         const stackId = pk + 'SV';
         datasetConfigs.push({ id: pk+'_sv_g', metric:'sv', product:pk, type:'bar', stack:stackId,
-          label: seriesLabel(pk, 'Surrender Value: Guaranteed'), rawData:g.map(v=>v||0), backgroundColor:scriptableBarColor(pal.guaranteed), order:3, minBarLength:2, borderColor:'#fff', borderWidth:1 });
+          label: seriesLabel(pk, 'Surrender Value: Guaranteed'), rawData:g.map(v=>v||0), backgroundColor:scriptableBarColor(pal.guaranteed), legendColor: pal.guaranteed, order:3, minBarLength:2, borderColor:'#fff', borderWidth:1 });
         datasetConfigs.push({ id: pk+'_sv_ng', metric:'sv', product:pk, type:'bar', stack:stackId,
-          label: seriesLabel(pk, 'Surrender Value: Non-Guaranteed'), rawData:ng.map(v=>v||0), backgroundColor:scriptableBarColor(pal.nonGuaranteed), order:3, minBarLength:2, borderColor:'#fff', borderWidth:1 });
+          label: seriesLabel(pk, 'Surrender Value: Non-Guaranteed'), rawData:ng.map(v=>v||0), backgroundColor:scriptableBarColor(pal.nonGuaranteed), legendColor: pal.nonGuaranteed, order:3, minBarLength:2, borderColor:'#fff', borderWidth:1 });
         datasetConfigs.push({ id: pk+'_sv_t', metric:'sv', product:pk, type:'line', stack: pk+'_sv_t',
           label: seriesLabel(pk, 'Total Surrender Value'), rawData:t.map(v=>v||0), borderColor:pal.total, backgroundColor:pal.total,
           borderWidth:2.5, pointRadius:3, tension:.15, order:1, fill:false });
+        const rawPar = state.products[pk];
+        if (p.scenario === 'withdrawal' && rawPar && rawPar.sv && rawPar.sv.total &&
+            rawPar.sv.total.some(v => v !== null && v !== undefined)){
+          const ghost = alignToYears(years, rawPar.sv.years, rawPar.sv.ages, rawPar.sv.total);
+          datasetConfigs.push({ id: pk+'_sv_t_ghost', metric:'sv', product:pk, type:'line', stack: pk+'_sv_t_ghost', isGhostRef:true,
+            label: seriesLabel(pk, 'Total Surrender Value (No Withdrawal)'), rawData: ghost.map(v=>v||0),
+            borderColor: GHOST_LINE_COLOR, backgroundColor: GHOST_LINE_COLOR,
+            borderWidth:1.6, pointRadius:0, tension:.15, order:5, fill:false });
+        }
       }
       if (p.db){
         const b = alignToYears(years, p.db.years, p.db.ages, p.db.guaranteed);   // (B) DB Guaranteed
         const cd = alignToYears(years, p.db.years, p.db.ages, p.db.nonGuaranteed); // (C+D) DB Non-Guaranteed
         const t = alignToYears(years, p.db.years, p.db.ages, p.db.total);         // Net = higher of (B) or (E)
-        // (A) Guaranteed Cash Value is the SV-side guaranteed figure and is part of (E)=(A+C+D) —
-        // pulled from the product's own SV series (same color as the SV chart's Guaranteed bar)
-        // so the two comparison groups — (B) alone vs (A)+(C+D)=(E) — render as separate, adjacent
-        // bar clusters rather than one misleading combined stack.
-        const a = (p.sv && p.sv.guaranteed) ? alignToYears(years, p.sv.years, p.sv.ages, p.sv.guaranteed) : years.map(()=>0);
+        // (A) Guaranteed Cash Value: prefer the DB table's own (A) column when present
+        // (withdrawal scenario), otherwise the SV-side guaranteed figure.
+        const aSeries = (p.db.guaranteedCashValue && p.db.guaranteedCashValue.some(v => v !== null && v !== undefined))
+          ? { years: p.db.years, ages: p.db.ages, values: p.db.guaranteedCashValue }
+          : (p.sv && p.sv.guaranteed) ? { years: p.sv.years, ages: p.sv.ages, values: p.sv.guaranteed } : null;
+        const a = aSeries ? alignToYears(years, aSeries.years, aSeries.ages, aSeries.values) : years.map(()=>0);
         const stackB = pk + 'DB_B';
         const stackE = pk + 'DB_E';
         datasetConfigs.push({ id: pk+'_db_b', metric:'db', product:pk, type:'bar', stack:stackB,
-          label: seriesLabel(pk, 'Death Benefit: Guaranteed (B)'), rawData:b.map(v=>v||0), backgroundColor:scriptableBarColor(pal.dbGuaranteed), order:3, minBarLength:2, borderColor:'#fff', borderWidth:1 });
+          label: seriesLabel(pk, 'Death Benefit: Guaranteed (B)'), rawData:b.map(v=>v||0), backgroundColor:scriptableBarColor(pal.dbGuaranteed), legendColor: pal.dbGuaranteed, order:3, minBarLength:2, borderColor:'#fff', borderWidth:1 });
         datasetConfigs.push({ id: pk+'_db_a', metric:'db', product:pk, type:'bar', stack:stackE,
-          label: seriesLabel(pk, 'Guaranteed Cash Value (A)'), rawData:a.map(v=>v||0), backgroundColor:scriptableBarColor(pal.guaranteed), order:3, minBarLength:2, borderColor:'#fff', borderWidth:1 });
+          label: seriesLabel(pk, 'Guaranteed Cash Value (A)'), rawData:a.map(v=>v||0), backgroundColor:scriptableBarColor(pal.guaranteed), legendColor: pal.guaranteed, order:3, minBarLength:2, borderColor:'#fff', borderWidth:1 });
         datasetConfigs.push({ id: pk+'_db_cd', metric:'db', product:pk, type:'bar', stack:stackE,
-          label: seriesLabel(pk, 'Death Benefit: Non-Guaranteed (C+D)'), rawData:cd.map(v=>v||0), backgroundColor:scriptableBarColor(pal.dbNonGuaranteed), order:3, minBarLength:2, borderColor:'#fff', borderWidth:1 });
+          label: seriesLabel(pk, 'Death Benefit: Non-Guaranteed (C+D)'), rawData:cd.map(v=>v||0), backgroundColor:scriptableBarColor(pal.dbNonGuaranteed), legendColor: pal.dbNonGuaranteed, order:3, minBarLength:2, borderColor:'#fff', borderWidth:1 });
         datasetConfigs.push({ id: pk+'_db_t', metric:'db', product:pk, type:'line', stack: pk+'_db_t',
           label: seriesLabel(pk, 'Net Death Benefit'), rawData:t.map(v=>v||0), borderColor:pal.dbTotal, backgroundColor:pal.dbTotal,
-          borderWidth:2.5, pointRadius:3, tension:.15, order:1, fill:false, borderDash:[6,3] });
+          borderWidth:2.5, pointRadius:3, tension:.15, order:1, fill:false, legendColor: pal.dbTotal });
       }
     } else if (p.type === 'flat'){
-      if (p.sv){
+      if (p.dualBasis && p.sv && p.sv.guaranteed && p.sv.currentAssumed){
+        const gSv = alignToYears(years, p.sv.years, p.sv.ages, p.sv.guaranteed.surrenderValue);
+        const aSv = alignToYears(years, p.sv.years, p.sv.ages, p.sv.currentAssumed.surrenderValue);
+        const dualPal = DUAL_BASIS_LINE[pk] || DUAL_BASIS_LINE.p1;
+        datasetConfigs.push({ id: pk+'_sv_sv_g', metric:'sv', product:pk, type:'line', stack: pk+'_sv_sv_g',
+          label: seriesLabel(pk, 'Surrender Value (Guaranteed)'), rawData: gSv.map(v=>v||0),
+          borderColor:dualPal.guaranteed, backgroundColor:dualPal.guaranteed, legendColor: dualPal.guaranteed,
+          borderWidth:2.5, pointRadius:3, tension:.15, order:0, fill:false });
+        datasetConfigs.push({ id: pk+'_sv_sv_a', metric:'sv', product:pk, type:'line', stack: pk+'_sv_sv_a',
+          label: seriesLabel(pk, 'Surrender Value (Current Assumed)'), rawData: aSv.map(v=>v||0),
+          borderColor:dualPal.assumed, backgroundColor:dualPal.assumed, legendColor: dualPal.assumed,
+          borderWidth:2.5, pointRadius:3, tension:.15, order:0, fill:false });
+        const avSrc = p.sv.currentAssumed.accountValue || p.sv.accountValue;
+        if (avSrc && avSrc.some(v => v !== null && v !== undefined)){
+          const av = alignToYears(years, p.sv.years, p.sv.ages, avSrc);
+          datasetConfigs.push({ id: pk+'_sv_av', metric:'sv', product:pk, type:'line', stack: pk+'_sv_av', isAvRef:true,
+            label: seriesLabel(pk, 'Account Value'), rawData: av.map(v=>v||0),
+            borderColor:'#b8bec8', backgroundColor:'#b8bec8', legendColor:'#b8bec8',
+            borderWidth:1.3, pointRadius:0, tension:.15, order:4, fill:false });
+        }
+      } else if (p.sv){
         if (p.sv.accountValue && p.sv.accountValue.some(v=>v!==null)){
           const av = alignToYears(years, p.sv.years, p.sv.ages, p.sv.accountValue);
           datasetConfigs.push({ id: pk+'_sv_av', metric:'sv', product:pk, type:'line', stack: pk+'_sv_av',
@@ -1151,9 +1899,30 @@ function buildDatasetConfigs(){
           datasetConfigs.push({ id: pk+'_sv_sv', metric:'sv', product:pk, type:'line', stack: pk+'_sv_sv',
             label: seriesLabel(pk, 'Total Surrender Value'), rawData: sv.map(v=>v||0), borderColor:pal.surrenderValue, backgroundColor:pal.surrenderValue,
             borderWidth:2.5, pointRadius:3, tension:.15, order:0, fill:false });
+          const rawFlat = state.products[pk];
+          if (p.scenario === 'withdrawal' && rawFlat && rawFlat.sv && rawFlat.sv.surrenderValue &&
+              rawFlat.sv.surrenderValue.some(v => v !== null && v !== undefined)){
+            const ghost = alignToYears(years, rawFlat.sv.years, rawFlat.sv.ages, rawFlat.sv.surrenderValue);
+            datasetConfigs.push({ id: pk+'_sv_sv_ghost', metric:'sv', product:pk, type:'line', stack: pk+'_sv_sv_ghost', isGhostRef:true,
+              label: seriesLabel(pk, 'Total Surrender Value (No Withdrawal)'), rawData: ghost.map(v=>v||0),
+              borderColor: GHOST_LINE_COLOR, backgroundColor: GHOST_LINE_COLOR,
+              borderWidth:1.6, pointRadius:0, tension:.15, order:5, fill:false });
+          }
         }
       }
-      if (p.db && p.db.deathBenefit && p.db.deathBenefit.some(v=>v!==null)){
+      if (p.dualBasis && p.db && p.db.guaranteed && p.db.currentAssumed){
+        const gDb = alignToYears(years, p.db.years, p.db.ages, p.db.guaranteed.deathBenefit);
+        const aDb = alignToYears(years, p.db.years, p.db.ages, p.db.currentAssumed.deathBenefit);
+        const dualPalDb = DUAL_BASIS_LINE[pk] || DUAL_BASIS_LINE.p1;
+        datasetConfigs.push({ id: pk+'_db_db_g', metric:'db', product:pk, type:'line', stack: pk+'_db_db_g',
+          label: seriesLabel(pk, 'Death Benefit (Guaranteed)'), rawData: gDb.map(v=>v||0),
+          borderColor:dualPalDb.guaranteed, backgroundColor:dualPalDb.guaranteed, legendColor: dualPalDb.guaranteed,
+          borderWidth:2.5, pointRadius:3, tension:.15, order:0, fill:false });
+        datasetConfigs.push({ id: pk+'_db_db_a', metric:'db', product:pk, type:'line', stack: pk+'_db_db_a',
+          label: seriesLabel(pk, 'Death Benefit (Current Assumed)'), rawData: aDb.map(v=>v||0),
+          borderColor:dualPalDb.assumed, backgroundColor:dualPalDb.assumed, legendColor: dualPalDb.assumed,
+          borderWidth:2.5, pointRadius:3, tension:.15, order:0, fill:false });
+      } else if (p.db && p.db.deathBenefit && p.db.deathBenefit.some(v=>v!==null)){
         const db = alignToYears(years, p.db.years, p.db.ages, p.db.deathBenefit);
         datasetConfigs.push({ id: pk+'_db_db', metric:'db', product:pk, type:'line', stack: pk+'_db_db',
           label: seriesLabel(pk, 'Death Benefit'), rawData: db.map(v=>v||0), borderColor:pal.deathBenefit, backgroundColor:pal.deathBenefit,
@@ -1169,17 +1938,31 @@ function buildDatasetConfigs(){
       ['sv','db'].forEach(m => {
         datasetConfigs.push({ id: pk+'_'+m+'_premium', metric:m, product:pk, type:'line', stack: pk+'_'+m+'_premium', isPremiumRef:true,
           label: seriesLabel(pk, 'Total Premium Paid'), rawData: premAligned.map(v=>v||0),
-          borderColor:'#6b7688', backgroundColor:'#6b7688',
-          borderWidth:2.3, pointRadius:0, tension:0, order:2, fill:false, borderDash:[4,3] });
+          borderColor:'#6b7688', backgroundColor:'#6b7688', legendColor:'#6b7688',
+          borderWidth:2.3, pointRadius:0, tension:0, order:2, fill:false });
       });
       if (p.prepayment && p.prepayment.lumpSum){
         const lumpArr = years.map(() => p.prepayment.lumpSum);
         ['sv','db'].forEach(m => {
           datasetConfigs.push({ id: pk+'_'+m+'_premium_prepay', metric:m, product:pk, type:'line', stack: pk+'_'+m+'_premium_prepay', isPremiumRef:true,
             label: seriesLabel(pk, 'Total Premium Paid (Prepayment)'), rawData: lumpArr,
-            borderColor:'#8e44ad', backgroundColor:'#8e44ad',
+            borderColor:'#8e44ad', backgroundColor:'#8e44ad', legendColor:'#8e44ad',
             borderWidth:2.3, pointRadius:0, tension:0, order:2, fill:false, borderDash:[8,3] });
         });
+      }
+    }
+
+    // Notional Amount After Cash Withdrawal — thin reference line on Death Benefit
+    // under the withdrawal scenario, showing how withdrawals erode the face amount.
+    if (p.scenario === 'withdrawal'){
+      const nSrc = (p.db && p.db.notionalAfterWithdrawal) ? p.db
+                 : (p.sv && p.sv.notionalAfterWithdrawal) ? p.sv : null;
+      if (nSrc && nSrc.notionalAfterWithdrawal.some(v => v !== null && v !== undefined)){
+        const notionalAligned = alignToYears(years, nSrc.years, nSrc.ages, nSrc.notionalAfterWithdrawal);
+        datasetConfigs.push({ id: pk+'_db_notional', metric:'db', product:pk, type:'line', stack: pk+'_db_notional', isNotionalRef:true,
+          label: seriesLabel(pk, 'Notional Amount After Cash Withdrawal'), rawData: notionalAligned.map(v=>v||0),
+          borderColor:'#2a9d8f', backgroundColor:'#2a9d8f', legendColor:'#2a9d8f',
+          borderWidth:2.3, pointRadius:0, tension:0, order:2, fill:false });
       }
     }
   });
@@ -1187,7 +1970,7 @@ function buildDatasetConfigs(){
   return { years, ages };
 }
 
-function ensureChart(years, ages){
+function ensureChart(years, ages, hideXTicks){
   const labels = years.map((y,i) => {
     if (ages[i] !== null && ages[i] !== undefined && ages[i] % 5 === 0) return [`Y${y}`, `อายุ ${ages[i]}`];
     return [`Y${y}`];
@@ -1201,16 +1984,19 @@ function ensureChart(years, ages){
   if (chart) { chart.destroy(); chart = null; }
   const staleTooltip = document.querySelector('#chartHolder .custom-tooltip');
   if (staleTooltip) staleTooltip.style.opacity = 0;
+  hideCompareTooltip();
   const ctx = document.getElementById('cmp').getContext('2d');
   chart = new Chart(ctx, {
     data: { labels, datasets: chartDatasets },
     options: {
       responsive:true, maintainAspectRatio:false,
-      layout:{ padding:{top:4} },
+      layout:{ padding:{top:4, right:8, bottom: hideXTicks ? 0 : 2} },
       interaction:{ mode:'index', intersect:false },
       scales:{
-        x:{ stacked:true, grid:{display:false}, ticks:{ font:{size:12.5,family:"'Inter','Kanit',sans-serif"}, autoSkip:true, maxTicksLimit:20, maxRotation:0, minRotation:0 } },
-        y:{ stacked:true, beginAtZero:true, ticks:{ maxTicksLimit:7, font:{size:12.5,family:"'Inter','Kanit',sans-serif"},
+        x:{ stacked:true, offset:true, grid:{display:false},
+            ticks:{ display:!hideXTicks, font:{size:12.5,family:"'Inter','Kanit',sans-serif"}, autoSkip:true, maxTicksLimit:20, maxRotation:0, minRotation:0 } },
+        y:{ stacked:true, beginAtZero:true, afterFit: pinSharedYAxis,
+            ticks:{ maxTicksLimit:7, font:{size:12.5,family:"'Inter','Kanit',sans-serif"},
               callback:(v)=> formatMoneyAxis(v) }, grid:{color:'#eee'} }
       },
       plugins:{
@@ -1222,23 +2008,115 @@ function ensureChart(years, ages){
       },
       onHover: (evt, elements) => {
         const idx = (elements && elements.length) ? elements[0].index : null;
-        if (chart._hoveredIdx !== idx){
-          chart._hoveredIdx = idx;
-          chart.update('none');
-        }
+        if (idx !== null) setCompareHover(idx);
       }
     },
-    plugins: [premiumLabelPlugin, breakevenMarkerPlugin]
+    plugins: [premiumLabelPlugin, breakevenMarkerPlugin, notionalAlertPlugin]
   });
   chart._hoveredIdx = null;
   chart._years = years;
-  const canvasEl = document.getElementById('cmp');
-  if (!canvasEl._hoverLeaveWired){
-    canvasEl.addEventListener('mouseleave', () => {
-      if (chart && chart._hoveredIdx !== null){ chart._hoveredIdx = null; chart.update('none'); }
+  wireCompareHoverSync();
+}
+
+const WD_BAR_COLORS = { p1: '#5c6b7a', p2: '#9a7b4f' };
+
+function collectWithdrawalPanelSeries(years){
+  const series = [];
+  const multi = !!(state.products.p1 && state.products.p2);
+  ['p1','p2'].forEach(pk => {
+    if (state.product !== 'all' && state.product !== pk) return;
+    const view = resolveProductView(pk);
+    if (!view || view.scenario !== 'withdrawal') return;
+    const src = view.sv || view.db;
+    if (!src || !src.cashWithdrawal) return;
+    const hasWd = src.cashWithdrawal.some(v => v !== null && v !== undefined && v > 0);
+    if (!hasWd) return;
+    series.push({
+      pk,
+      label: multi ? `[${pk.toUpperCase()}] ถอนรายปี` : 'เงินถอนรายปี',
+      color: WD_BAR_COLORS[pk] || WD_BAR_COLORS.p1,
+      raw: years.map(y => {
+        const v = lookupSeriesValue(src, 'cashWithdrawal', y);
+        return (v === null || v === undefined || isNaN(v)) ? 0 : v;
+      })
     });
-    canvasEl._hoverLeaveWired = true;
+  });
+  return series;
+}
+
+function hideWdPanel(){
+  const el = document.getElementById('wdPanelHolder');
+  if (el) el.style.display = 'none';
+  if (wdChart){ wdChart.destroy(); wdChart = null; }
+}
+
+function wireCompareHoverSync(){
+  const stack = document.getElementById('chartStack');
+  if (!stack || stack._hoverWired) return;
+  stack.addEventListener('mouseleave', () => {
+    setCompareHover(null);
+    hideCompareTooltip();
+  });
+  stack._hoverWired = true;
+}
+
+function renderWdPanelTooltip(context, years, ages){
+  const { chart: c, tooltip } = context;
+  if (tooltip.opacity === 0 || !tooltip.dataPoints || !tooltip.dataPoints.length) return;
+  showCompareTooltipAt(tooltip.dataPoints[0].dataIndex, tooltip.caretX, c, years, ages);
+}
+
+function ensureWdPanel(years, ages, series){
+  const holder = document.getElementById('wdPanelHolder');
+  if (!series.length){
+    hideWdPanel();
+    return;
   }
+  holder.style.display = 'block';
+  const labels = years.map((y,i) => {
+    if (ages[i] !== null && ages[i] !== undefined && ages[i] % 5 === 0) return [`Y${y}`, `อายุ ${ages[i]}`];
+    return [`Y${y}`];
+  });
+  const mult = ccyMultiplier();
+  const fs = state.fontScale;
+  const datasets = series.map(s => ({
+    type: 'bar',
+    label: s.label,
+    data: s.raw.map(v => v * mult),
+    backgroundColor: scriptableBarColor(s.color),
+    borderWidth: 0,
+    barPercentage: 0.72,
+    categoryPercentage: series.length > 1 ? 0.72 : 0.55
+  }));
+  if (wdChart){ wdChart.destroy(); wdChart = null; }
+  const stale = holder.querySelector('.custom-tooltip');
+  if (stale) stale.style.opacity = 0;
+  const ctx = document.getElementById('wdPanel').getContext('2d');
+  wdChart = new Chart(ctx, {
+    type: 'bar',
+    data: { labels, datasets },
+    options: {
+      responsive:true, maintainAspectRatio:false,
+      layout:{ padding:{top:2, right:8, bottom:2} },
+      interaction:{ mode:'index', intersect:false },
+      scales:{
+        x:{ offset:true, grid:{display:false},
+            ticks:{ font:{size:12.5*fs,family:"'Inter','Kanit',sans-serif"}, autoSkip:true, maxTicksLimit:20, maxRotation:0, minRotation:0 } },
+        y:{ beginAtZero:true, afterFit: pinSharedYAxis,
+            ticks:{ maxTicksLimit:3, font:{size:11.5*fs,family:"'Inter','Kanit',sans-serif"},
+              callback:(v)=> formatMoneyAxis(v) }, grid:{color:'#f0f0f0'} }
+      },
+      plugins:{
+        legend:{ display: datasets.length > 1, position:'top', labels:{ boxWidth:10, font:{size:10.5*fs,family:"'Kanit','Inter',sans-serif"} } },
+        tooltip:{ enabled:false, external: (context) => renderWdPanelTooltip(context, years, ages) }
+      },
+      onHover: (evt, elements) => {
+        const idx = (elements && elements.length) ? elements[0].index : null;
+        if (idx !== null) setCompareHover(idx);
+      }
+    }
+  });
+  wdChart._hoveredIdx = null;
 }
 
 function buildLegend(){
@@ -1255,7 +2133,7 @@ function buildLegend(){
     item.className = 'legend-item' + (isOff ? ' off' : '');
     const swatch = document.createElement('span');
     swatch.className = 'swatch' + (cfg.type === 'line' ? ' line' : '');
-    swatch.style.background = cfg.type === 'line' ? cfg.borderColor : cfg.backgroundColor;
+    swatch.style.background = cfg.type === 'line' ? cfg.borderColor : (cfg.legendColor || cfg.backgroundColor);
     const lbl = document.createElement('span');
     lbl.className = 'lbl';
     lbl.textContent = cfg.label;
@@ -1268,7 +2146,60 @@ function buildLegend(){
   });
 }
 
+function updatePrepayToggleUI(){
+  const group = document.getElementById('prepayGroup');
+  if (!group) return;
+  const keys = relevantProductKeys();
+  const hasPrepay = keys.some(pk => productHasPrepayment(state.products[pk]));
+  group.style.display = hasPrepay ? 'flex' : 'none';
+  const seg = document.getElementById('prepaySeg');
+  if (seg){
+    seg.querySelectorAll('.seg-btn').forEach(b => {
+      const on = b.getAttribute('data-prepay') === 'on';
+      b.classList.toggle('active', on === !!state.showPrepay);
+    });
+  }
+}
+
+function updateScenarioToggleUI(){
+  const group = document.getElementById('scenarioGroup');
+  if (!group) return;
+  const keys = relevantProductKeys();
+  const wdKeys = keys.filter(pk => productHasWithdrawal(state.products[pk]));
+  group.style.display = wdKeys.length ? 'flex' : 'none';
+  const scenarios = new Set(wdKeys.map(pk => state.scenario[pk] || 'base'));
+  const seg = document.getElementById('scenarioSeg');
+  if (seg){
+    seg.querySelectorAll('.seg-btn').forEach(b => {
+      const v = b.getAttribute('data-scenario');
+      b.classList.toggle('active', scenarios.size === 1 && scenarios.has(v));
+    });
+  }
+  const hint = document.getElementById('scenarioHint');
+  if (!hint) return;
+  const p1 = state.products.p1, p2 = state.products.p2;
+  if (p1 && p2){
+    const h1 = productHasWithdrawal(p1), h2 = productHasWithdrawal(p2);
+    const effective1 = h1 ? (state.scenario.p1 || 'base') : 'base';
+    const effective2 = h2 ? (state.scenario.p2 || 'base') : 'base';
+    const differAvail = h1 !== h2;
+    const differSel = effective1 !== effective2;
+    if (differAvail || differSel){
+      hint.style.display = 'block';
+      hint.textContent = differAvail
+        ? 'มีเพียงบางสินค้าที่มีตาราง Withdrawal — เปรียบเทียบได้ แต่แนะนำให้เลือกสถานการณ์เดียวกันเมื่อทำได้'
+        : 'สินค้าทั้งสองใช้สถานการณ์ต่างกัน — เลือกสถานการณ์เดียวกันจะเปรียบเทียบได้ตรงกว่า';
+    } else {
+      hint.style.display = 'none';
+    }
+  } else {
+    hint.style.display = 'none';
+  }
+}
+
 function render(){
+  updateScenarioToggleUI();
+  updatePrepayToggleUI();
   const compareEl = document.getElementById('compareView');
   const xirrEl = document.getElementById('xirrView');
   const legendPanel = document.getElementById('legendPanel');
@@ -1301,23 +2232,31 @@ function render(){
 function renderCompareView(){
   const hasAny = state.products.p1 || state.products.p2;
   document.getElementById('emptyState').style.display = hasAny ? 'none' : 'flex';
-  document.getElementById('chartHolder').style.display = hasAny ? 'block' : 'none';
-  document.getElementById('chartHint').style.display = hasAny ? 'block' : 'none';
-  if (!hasAny){ document.getElementById('compareLegendNote').style.display = 'none'; buildLegend(); return; }
+  document.getElementById('chartStack').style.display = hasAny ? 'flex' : 'none';
+  document.getElementById('chartHintRow').style.display = hasAny ? 'flex' : 'none';
+  if (!hasAny){
+    document.getElementById('compareLegendNote').style.display = 'none';
+    hideWdPanel();
+    buildLegend();
+    return;
+  }
 
   const { years, ages } = buildDatasetConfigs();
   if (!years || years.length === 0){
     document.getElementById('emptyState').style.display = 'flex';
-    document.getElementById('chartHolder').style.display = 'none';
-    document.getElementById('chartHint').style.display = 'none';
+    document.getElementById('chartStack').style.display = 'none';
+    document.getElementById('chartHintRow').style.display = 'none';
     document.getElementById('compareLegendNote').style.display = 'none';
+    hideWdPanel();
     buildLegend();
     return;
   }
   xirrLookupCompare = computeXirrLookupForYears(years);
+  const wdSeries = collectWithdrawalPanelSeries(years);
 
   try {
-    ensureChart(years, ages);
+    ensureChart(years, ages, wdSeries.length > 0);
+    ensureWdPanel(years, ages, wdSeries);
 
     const mult = ccyMultiplier();
     chart.data.datasets.forEach((d, i) => {
@@ -1339,7 +2278,14 @@ function renderCompareView(){
     });
     let maxBarStack = 0;
     Object.values(stackSums).forEach(arr => arr.forEach(v => { if (v > maxBarStack) maxBarStack = v; }));
-    chart.options.scales.y.max = maxBarStack > 0 ? maxBarStack / 0.8 : undefined;
+    let maxLine = 0;
+    chart.data.datasets.forEach((d, i) => {
+      const cfg = datasetConfigs[i];
+      if (cfg.type !== 'line' || !chart.isDatasetVisible(i)) return;
+      d.data.forEach(v => { if (v > maxLine) maxLine = v; });
+    });
+    const maxVal = Math.max(maxBarStack, maxLine);
+    chart.options.scales.y.max = maxVal > 0 ? maxVal / 0.8 : undefined;
 
     const fs = state.fontScale;
     chart.options.scales.x.ticks.font.size = 12.5 * fs;
@@ -1348,7 +2294,9 @@ function renderCompareView(){
     chart.options.plugins.tooltip.bodyFont.size = 19 * fs;
     chart.options.plugins.tooltip.footerFont.size = 17 * fs;
 
+    chart._notionalAlerts = (state.metric === 'db') ? collectNotionalAlerts(years) : [];
     chart.update();
+    if (wdChart) wdChart.update();
   } catch (chartErr){
     console.error('Compare chart render error:', chartErr);
   }
@@ -1364,7 +2312,30 @@ function renderCompareView(){
 
   const metricTh = state.metric === 'sv' ? 'Surrender Value / Account Value' : 'Death Benefit';
   const dbNote = state.metric === 'db' ? '  |  ⓘ แท่งซ้าย = (B) Guaranteed | แท่งขวา = (A)+(C+D)=(E)  |  เส้น Net Death Benefit = ค่าที่สูงกว่าระหว่าง (B) หรือ (E)' : '';
-  document.getElementById('chartHint').textContent = `แกน X = Policy Year (และอายุผู้เอาประกัน)  |  แกน Y = ${metricTh} (${ccyLabel()})${dbNote}`;
+  let hint = `แกน X = Policy Year (และอายุผู้เอาประกัน)  |  แกน Y = ${metricTh} (${ccyLabel()})${dbNote}`;
+  if (wdSeries.length) hint += '  |  แท่งล่าง = เงินถอนรายปี';
+  if (state.metric === 'db'){
+    const alerts = collectNotionalAlerts(years);
+    const hard = alerts.filter(a => a.crossHard);
+    const soft = alerts.filter(a => a.crossSoft && !a.crossHard);
+    if (hard.length){
+      const bits = hard.map(a => `ปีที่ ${a.crossHard.year}`);
+      hint += `  |  ⚠ Notional Amount ต่ำกว่า ${formatMoney(NOTIONAL_HARD_USD * ccyMultiplier())} ตั้งแต่${bits.join(', ')}`;
+    } else if (soft.length){
+      const bits = soft.map(a => `ปีที่ ${a.crossSoft.year}`);
+      hint += `  |  ⓘ Notional Amount ต่ำกว่า ${formatMoney(NOTIONAL_SOFT_USD * ccyMultiplier())} ตั้งแต่${bits.join(', ')}`;
+    }
+  }
+  if (hasVisibleDualBasis()) hint += '  |  ⓘ ' + dualBasisDisclaimer(false);
+  document.getElementById('chartHint').textContent = hint;
+  const purposePop = document.getElementById('chartPurposePop');
+  if (purposePop){
+    let purpose = state.metric === 'db'
+      ? 'เปรียบเทียบเงินคุ้มครองกรณีเสียชีวิต ตามปีกรมธรรม์ พร้อมเบี้ยที่จ่ายไปและทุนประกันหลังถอนเป็นเส้นอ้างอิง'
+      : 'เปรียบเทียบมูลค่าเวนคืน/มูลค่าบัญชี ตามปีกรมธรรม์ พร้อมเบี้ยที่จ่ายไปเป็นเส้นอ้างอิง';
+    if (hasVisibleDualBasis()) purpose += ' — ' + dualBasisDisclaimer(true);
+    purposePop.textContent = purpose;
+  }
 }
 
 /* ---------- XIRR + Breakeven view ---------- */
@@ -1378,13 +2349,17 @@ function getSvSeriesForXirr(product){
   if (product.type === 'par'){
     totals = s.total; guaranteedArr = s.guaranteed; nonGuarArr = s.nonGuaranteed;
   } else {
-    totals = s.surrenderValue || s.accountValue; guaranteedArr = null; nonGuarArr = null;
+    totals = s.surrenderValue || s.accountValue;
+    guaranteedArr = (product.dualBasis && s.guaranteed && s.guaranteed.surrenderValue) ? s.guaranteed.surrenderValue : null;
+    nonGuarArr = null;
   }
   const premiums = s.premium || years.map(() => null);
   const hasPremium = premiums.some(p => p !== null && p !== undefined);
   const hasTotals = totals && totals.some(v => v !== null && v !== undefined);
   if (!hasPremium || !hasTotals) return null;
-  return { years, ages: s.ages, totals, guaranteedArr, nonGuarArr, premiums };
+  const cashWithdrawal = s.cashWithdrawal || null;
+  const cumulativeWithdrawal = s.cumulativeWithdrawal || null;
+  return { years, ages: s.ages, totals, guaranteedArr, nonGuarArr, premiums, cashWithdrawal, cumulativeWithdrawal };
 }
 
 /* For the compare-view tooltip: precompute XIRR (normal + prepayment, when available) per
@@ -1394,18 +2369,18 @@ let xirrLookupCompare = {};
 function computeXirrLookupForYears(years){
   const out = {};
   ['p1','p2'].forEach(pk => {
-    const p = state.products[pk];
+    const p = resolveProductView(pk);
     if (!p) return;
     const data = getSvSeriesForXirr(p);
     if (!data) return;
-    const xirrArr = computeXirrSeries(data.years, data.totals, data.premiums);
+    const xirrArr = computeXirrSeries(data.years, data.totals, data.premiums, data.cashWithdrawal);
     const xirrAligned = alignToYears(years, data.years, data.ages, xirrArr);
     const breakevenYear = findBreakevenYear(data.years, xirrArr);
     const gBreak = data.guaranteedArr ? findGuaranteedBreakeven(data.years, data.guaranteedArr, data.premiums) : null;
     let xirrPrepayAligned = null, breakevenYearPrepay = null, gBreakPrepay = null;
     if (p.prepayment && p.prepayment.lumpSum){
       const prepayPremiums = data.years.map(() => p.prepayment.lumpSum);
-      const xirrPrepayArr = computeXirrSeries(data.years, data.totals, prepayPremiums);
+      const xirrPrepayArr = computeXirrSeries(data.years, data.totals, prepayPremiums, data.cashWithdrawal);
       xirrPrepayAligned = alignToYears(years, data.years, data.ages, xirrPrepayArr);
       breakevenYearPrepay = findBreakevenYear(data.years, xirrPrepayArr);
       gBreakPrepay = data.guaranteedArr ? findGuaranteedBreakeven(data.years, data.guaranteedArr, prepayPremiums) : null;
@@ -1431,6 +2406,8 @@ function renderXirrView(){
     document.getElementById('xirrEmptyState').style.display = 'flex';
     document.getElementById('xirrChartHolder').style.display = 'none';
     document.getElementById('xirrCards').innerHTML = '';
+    document.getElementById('xirrCards').classList.remove('compact-row');
+    document.getElementById('xirrCards').style.gridTemplateColumns = '';
     document.getElementById('xirrTable').innerHTML = '';
     document.getElementById('xirrLegendNote').style.display = 'none';
     document.getElementById('xirrNormalLabel').style.display = 'none';
@@ -1443,13 +2420,15 @@ function renderXirrView(){
   if (state.xirrProduct === 'p2' && !p2ok) state.xirrProduct = 'p1';
   seg.querySelectorAll('.seg-btn').forEach(b => b.classList.toggle('active', b.getAttribute('data-xirrproduct') === state.xirrProduct));
 
-  const product = state.products[state.xirrProduct];
+  const product = resolveProductView(state.xirrProduct);
   const data = getSvSeriesForXirr(product);
 
   if (!data){
     document.getElementById('xirrEmptyState').style.display = 'flex';
     document.getElementById('xirrChartHolder').style.display = 'none';
     document.getElementById('xirrCards').innerHTML = '';
+    document.getElementById('xirrCards').classList.remove('compact-row');
+    document.getElementById('xirrCards').style.gridTemplateColumns = '';
     document.getElementById('xirrTable').innerHTML = '';
     document.getElementById('xirrLegendNote').style.display = 'none';
     document.getElementById('xirrNormalLabel').style.display = 'none';
@@ -1462,8 +2441,8 @@ function renderXirrView(){
   document.getElementById('xirrEmptyState').style.display = 'none';
   document.getElementById('xirrChartHolder').style.display = 'block';
 
-  const { years, ages, totals, guaranteedArr, nonGuarArr, premiums } = data;
-  const xirrArr = computeXirrSeries(years, totals, premiums);
+  const { years, ages, totals, guaranteedArr, nonGuarArr, premiums, cashWithdrawal, cumulativeWithdrawal } = data;
+  const xirrArr = computeXirrSeries(years, totals, premiums, cashWithdrawal);
   const breakevenYear = findBreakevenYear(years, xirrArr);
   const breakevenYearInterp = findBreakevenYearInterpolated(years, xirrArr);
   const gBreak = guaranteedArr ? findGuaranteedBreakeven(years, guaranteedArr, premiums) : null;
@@ -1477,7 +2456,7 @@ function renderXirrView(){
   let xirrArrPrepay = null, breakevenYearPrepay = null, breakevenYearPrepayInterp = null, gBreakPrepay = null, gBreakPrepayInterp = null;
   if (prepay && prepay.lumpSum){
     const prepayPremiums = years.map(() => prepay.lumpSum);
-    xirrArrPrepay = computeXirrSeries(years, totals, prepayPremiums);
+    xirrArrPrepay = computeXirrSeries(years, totals, prepayPremiums, cashWithdrawal);
     breakevenYearPrepay = findBreakevenYear(years, xirrArrPrepay);
     breakevenYearPrepayInterp = findBreakevenYearInterpolated(years, xirrArrPrepay);
     gBreakPrepay = guaranteedArr ? findGuaranteedBreakeven(years, guaranteedArr, prepayPremiums) : null;
@@ -1503,42 +2482,142 @@ function renderXirrView(){
     c.innerHTML = `<div class="lbl">${label}</div><div class="val">${value}</div>` + (sub ? `<div class="sub">${sub}</div>` : '');
     container.appendChild(c);
   }
+  function addPairCard(container, cls, label, lineA, lineB, sub){
+    const c = document.createElement('div');
+    c.className = 'xirr-card ' + cls;
+    c.innerHTML = `<div class="lbl">${label}</div>` +
+      `<div class="val-pair"><div><span class="mode">ปกติ</span> <span class="figure">${lineA}</span></div>` +
+      `<div><span class="mode prepay">Prepay</span> <span class="figure">${lineB}</span></div></div>` +
+      (sub ? `<div class="sub">${sub}</div>` : '');
+    container.appendChild(c);
+  }
 
   const cardsEl = document.getElementById('xirrCards');
   cardsEl.innerHTML = '';
-  addCard(cardsEl, 'premium', 'เบี้ยสะสมทั้งหมด',
-    totalPremium !== null ? formatMoney(totalPremium * mult) : '—',
-    sched ? `ชำระเบี้ย ${sched.term} ปี ปีละ ${formatMoney(sched.P * mult)}` : '');
-  addCard(cardsEl, 'breakeven', 'จุดคุ้มทุน (Cash Breakeven)',
-    breakevenYearInterp !== null ? ('ปีที่ ' + breakevenYearInterp.toFixed(1)) : 'ยังไม่ถึง',
-    breakevenYear !== null ? `≈ XIRR 0% (คำนวณ interpolation, ปีเต็มถัดไปคือปีที่ ${breakevenYear})` : '');
-  if (guaranteedArr){
-    addCard(cardsEl, 'gbreakeven', 'Guaranteed Breakeven',
-      gBreakInterp ? ('ปีที่ ' + gBreakInterp.year.toFixed(1)) : 'ยังไม่ถึง',
-      gBreakInterp ? `GCV ≈ ${formatMoney(gBreakInterp.guaranteedValue * mult)} (interpolation, ปีเต็มถัดไปคือปีที่ ${gBreak.year})` : 'GCV ยังไม่แซงเบี้ยสะสม');
-  } else {
-    addCard(cardsEl, 'gbreakeven', 'Guaranteed Breakeven', 'ไม่มีข้อมูล', 'สินค้านี้ไม่แยก Guaranteed/Non-Guaranteed');
+  const hasPrepayData = !!(xirrArrPrepay);
+  const showPrepay = hasPrepayData && showPrepayCompare();
+  const compactKpi = hasPrepayData;
+  cardsEl.classList.toggle('compact-row', compactKpi);
+
+  const lastXirrP = xirrArrPrepay ? xirrArrPrepay[lastIdx] : null;
+  const longXirrP = xirrArrPrepay && longIdx >= 0 ? xirrArrPrepay[longIdx] : null;
+
+  function withdrawalCardSub(){
+    if (!cashWithdrawal) return '';
+    const startIdx = cashWithdrawal.findIndex(w => w !== null && w !== undefined && w > 0);
+    if (startIdx < 0) return '';
+    const startY = years[startIdx];
+    const startA = ages ? ages[startIdx] : null;
+    const amt = cashWithdrawal[startIdx];
+    const later = cashWithdrawal.filter((w, i) => i >= startIdx && w !== null && w !== undefined && w > 0);
+    const level = later.length > 0 && later.every(w => Math.abs(w - amt) < 0.51);
+    return `เริ่มปีที่ ${startY}${startA !== null && startA !== undefined ? ' (อายุ ' + startA + ')' : ''}` +
+           (level ? ` ปีละ ${moneyHtml(amt * mult)}` : ' (ยอดถอนไม่คงที่ตามตาราง)');
   }
-  addCard(cardsEl, '', `ผลตอบแทนระยะยาว${longYear!==null?' (ปีที่ '+longYear+')':''}`,
-    longXirr !== null ? xirrColorSpan(longXirr, (longXirr*100).toFixed(2) + '% p.a.') : '—',
-    longSv!==null&&longSv!==undefined ? `SV = ${formatMoney(longSv*mult)}` : '');
-  addCard(cardsEl, '', `ถือยาวยิ่งดี (ปีที่ ${lastYear}${lastAge!==null&&lastAge!==undefined?', อายุ '+lastAge:''})`,
-    lastXirr !== null ? xirrColorSpan(lastXirr, (lastXirr*100).toFixed(2) + '% p.a.') : '—',
-    totals[lastIdx]!==null&&totals[lastIdx]!==undefined ? `SV = ${formatMoney(totals[lastIdx]*mult)}` : '');
+  function lastCumulativeWithdrawal(){
+    if (!cumulativeWithdrawal) return null;
+    for (let i = cumulativeWithdrawal.length - 1; i >= 0; i--){
+      const v = cumulativeWithdrawal[i];
+      if (v !== null && v !== undefined && !isNaN(v)) return v;
+    }
+    return null;
+  }
+
+  if (compactKpi){
+    if (showPrepay){
+      addPairCard(cardsEl, 'premium', 'เบี้ย / เงินจ่ายจริง',
+        totalPremium !== null ? formatMoney(totalPremium * mult) : '—',
+        formatMoney(prepay.lumpSum * mult),
+        sched ? `ชำระเบี้ย ${sched.term} ปี ปีละ ${moneyHtml(sched.P * mult)}` : '');
+    } else {
+      addCard(cardsEl, 'premium', 'เบี้ยสะสมทั้งหมด',
+        totalPremium !== null ? formatMoney(totalPremium * mult) : '—',
+        sched ? `ชำระเบี้ย ${sched.term} ปี ปีละ ${moneyHtml(sched.P * mult)}` : '');
+    }
+    if (product.scenario === 'withdrawal'){
+      const lastCum = lastCumulativeWithdrawal();
+      addCard(cardsEl, 'withdrawal', 'เงินถอนสะสมทั้งหมด',
+        lastCum !== null ? formatMoney(lastCum * mult) : '—', withdrawalCardSub());
+    }
+    if (showPrepay){
+      addPairCard(cardsEl, 'breakeven', 'จุดคุ้มทุน (Cash Breakeven)',
+        breakevenYearInterp !== null ? ('ปีที่ ' + breakevenYearInterp.toFixed(1)) : 'ยังไม่ถึง',
+        breakevenYearPrepayInterp !== null ? ('ปีที่ ' + breakevenYearPrepayInterp.toFixed(1)) : 'ยังไม่ถึง',
+        '');
+      if (guaranteedArr){
+        addPairCard(cardsEl, 'gbreakeven', 'Guaranteed Breakeven',
+          gBreakInterp ? ('ปีที่ ' + gBreakInterp.year.toFixed(1)) : 'ยังไม่ถึง',
+          gBreakPrepayInterp ? ('ปีที่ ' + gBreakPrepayInterp.year.toFixed(1)) : 'ยังไม่ถึง',
+          '');
+      } else {
+        addCard(cardsEl, 'gbreakeven', 'Guaranteed Breakeven', 'ไม่มีข้อมูล', 'สินค้านี้ไม่แยก Guaranteed/Non-Guaranteed');
+      }
+      addPairCard(cardsEl, '', `ผลตอบแทนระยะยาว${longYear!==null?' (ปีที่ '+longYear+')':''}`,
+        longXirr !== null ? xirrColorSpan(longXirr, (longXirr*100).toFixed(2) + '%') : '—',
+        longXirrP !== null ? xirrColorSpan(longXirrP, (longXirrP*100).toFixed(2) + '%') : '—',
+        longSv!==null&&longSv!==undefined ? `SV = ${moneyHtml(longSv*mult)}` : '');
+    } else {
+      addCard(cardsEl, 'breakeven', 'จุดคุ้มทุน (Cash Breakeven)',
+        breakevenYearInterp !== null ? ('ปีที่ ' + breakevenYearInterp.toFixed(1)) : 'ยังไม่ถึง',
+        breakevenYear !== null ? `≈ XIRR 0% (คำนวณ interpolation, ปีเต็มถัดไปคือปีที่ ${breakevenYear})` : '');
+      if (guaranteedArr){
+        addCard(cardsEl, 'gbreakeven', 'Guaranteed Breakeven',
+          gBreakInterp ? ('ปีที่ ' + gBreakInterp.year.toFixed(1)) : 'ยังไม่ถึง',
+          gBreakInterp ? `GCV ≈ ${moneyHtml(gBreakInterp.guaranteedValue * mult)} (interpolation, ปีเต็มถัดไปคือปีที่ ${gBreak.year})` : 'GCV ยังไม่แซงเบี้ยสะสม');
+      } else {
+        addCard(cardsEl, 'gbreakeven', 'Guaranteed Breakeven', 'ไม่มีข้อมูล', 'สินค้านี้ไม่แยก Guaranteed/Non-Guaranteed');
+      }
+      addCard(cardsEl, '', `ผลตอบแทนระยะยาว${longYear!==null?' (ปีที่ '+longYear+')':''}`,
+        longXirr !== null ? xirrColorSpan(longXirr, (longXirr*100).toFixed(2) + '% p.a.') : '—',
+        longSv!==null&&longSv!==undefined ? `SV = ${moneyHtml(longSv*mult)}` : '');
+    }
+  } else {
+    addCard(cardsEl, 'premium', 'เบี้ยสะสมทั้งหมด',
+      totalPremium !== null ? formatMoney(totalPremium * mult) : '—',
+      sched ? `ชำระเบี้ย ${sched.term} ปี ปีละ ${moneyHtml(sched.P * mult)}` : '');
+    if (cumulativeWithdrawal){
+      const lastCum = lastCumulativeWithdrawal();
+      addCard(cardsEl, 'withdrawal', 'เงินถอนสะสมทั้งหมด',
+        lastCum !== null ? formatMoney(lastCum * mult) : '—', withdrawalCardSub());
+    }
+    addCard(cardsEl, 'breakeven', 'จุดคุ้มทุน (Cash Breakeven)',
+      breakevenYearInterp !== null ? ('ปีที่ ' + breakevenYearInterp.toFixed(1)) : 'ยังไม่ถึง',
+      breakevenYear !== null ? `≈ XIRR 0% (คำนวณ interpolation, ปีเต็มถัดไปคือปีที่ ${breakevenYear})` : '');
+    if (guaranteedArr){
+      addCard(cardsEl, 'gbreakeven', 'Guaranteed Breakeven',
+        gBreakInterp ? ('ปีที่ ' + gBreakInterp.year.toFixed(1)) : 'ยังไม่ถึง',
+        gBreakInterp ? `GCV ≈ ${moneyHtml(gBreakInterp.guaranteedValue * mult)} (interpolation, ปีเต็มถัดไปคือปีที่ ${gBreak.year})` : 'GCV ยังไม่แซงเบี้ยสะสม');
+    } else {
+      addCard(cardsEl, 'gbreakeven', 'Guaranteed Breakeven', 'ไม่มีข้อมูล', 'สินค้านี้ไม่แยก Guaranteed/Non-Guaranteed');
+    }
+    addCard(cardsEl, '', `ผลตอบแทนระยะยาว${longYear!==null?' (ปีที่ '+longYear+')':''}`,
+      longXirr !== null ? xirrColorSpan(longXirr, (longXirr*100).toFixed(2) + '% p.a.') : '—',
+      longSv!==null&&longSv!==undefined ? `SV = ${moneyHtml(longSv*mult)}` : '');
+    addCard(cardsEl, '', `ถือยาวยิ่งดี (ปีที่ ${lastYear}${lastAge!==null&&lastAge!==undefined?', อายุ '+lastAge:''})`,
+      lastXirr !== null ? xirrColorSpan(lastXirr, (lastXirr*100).toFixed(2) + '% p.a.') : '—',
+      totals[lastIdx]!==null&&totals[lastIdx]!==undefined ? `SV = ${moneyHtml(totals[lastIdx]*mult)}` : '');
+  }
+
+  if (compactKpi){
+    const n = cardsEl.children.length;
+    cardsEl.style.gridTemplateColumns = n ? `repeat(${n}, 1fr)` : '';
+  } else {
+    cardsEl.style.gridTemplateColumns = '';
+  }
 
   document.getElementById('xirrLegendNote').style.display = 'flex';
+  const prepayNoteEl = document.getElementById('xirrPrepayLegendNote');
+  if (prepayNoteEl) prepayNoteEl.style.display = showPrepay ? '' : 'none';
 
-  // ---- Summary cards (prepayment) ----
+  // ---- Summary cards (prepayment) — separate row only when NOT in compact withdrawal+prepay mode ----
   const normalLabelEl = document.getElementById('xirrNormalLabel');
   const prepayLabelEl = document.getElementById('xirrPrepayLabel');
   const cardsPrepayEl = document.getElementById('xirrCardsPrepay');
-  if (xirrArrPrepay){
+  if (xirrArrPrepay && !compactKpi){
     normalLabelEl.style.display = 'flex';
     prepayLabelEl.style.display = 'flex';
     cardsPrepayEl.style.display = 'grid';
     cardsPrepayEl.innerHTML = '';
-    const lastXirrP = xirrArrPrepay[lastIdx];
-    const longXirrP = longIdx >= 0 ? xirrArrPrepay[longIdx] : null;
     addCard(cardsPrepayEl, 'premium', 'เงินจ่ายจริงครั้งเดียว',
       formatMoney(prepay.lumpSum * mult),
       prepay.source === 'chubb'
@@ -1581,8 +2660,8 @@ function renderXirrView(){
   if (isFinite(rangeLimit)){
     if (breakevenYear !== null && breakevenYear > rangeLimit) outOfView.push(`Cash Breakeven (ปกติ, ปีที่ ${breakevenYear})`);
     if (gBreak !== null && gBreak.year > rangeLimit) outOfView.push(`Guaranteed Breakeven (ปกติ, ปีที่ ${gBreak.year})`);
-    if (breakevenYearPrepay !== null && breakevenYearPrepay > rangeLimit) outOfView.push(`Cash Breakeven (Prepayment, ปีที่ ${breakevenYearPrepay})`);
-    if (gBreakPrepay !== null && gBreakPrepay.year > rangeLimit) outOfView.push(`Guaranteed Breakeven (Prepayment, ปีที่ ${gBreakPrepay.year})`);
+    if (showPrepay && breakevenYearPrepay !== null && breakevenYearPrepay > rangeLimit) outOfView.push(`Cash Breakeven (Prepayment, ปีที่ ${breakevenYearPrepay})`);
+    if (showPrepay && gBreakPrepay !== null && gBreakPrepay.year > rangeLimit) outOfView.push(`Guaranteed Breakeven (Prepayment, ปีที่ ${gBreakPrepay.year})`);
   }
   if (outOfView.length){
     hintTxt += `  —  ⚠ ${outOfView.join(', ')} อยู่นอกช่วงที่แสดง กด "ทั้งหมด" เพื่อดู`;
@@ -1601,22 +2680,46 @@ function renderXirrView(){
     if (staleXirrTooltip) staleXirrTooltip.style.opacity = 0;
     const ctx = document.getElementById('xirrCanvas').getContext('2d');
     const fs = state.fontScale;
-    const datasets = [{
-      label: xirrArrPrepay ? 'แบบจ่ายทีละปี (ปกติ)' : 'XIRR (% p.a.)',
+    const datasets = [];
+    let vXirrGhost = null;
+    if (product.scenario === 'withdrawal'){
+      const raw = state.products[state.xirrProduct];
+      if (raw){
+        const baseData = getSvSeriesForXirr({
+          label: raw.label, type: raw.type, sv: raw.sv, db: raw.db, prepayment: raw.prepayment, scenario: 'base'
+        });
+        if (baseData){
+          const baseXirr = computeXirrSeries(baseData.years, baseData.totals, baseData.premiums, null);
+          vXirrGhost = visIdx.map(i => {
+            const y = years[i];
+            const bi = baseData.years.indexOf(y);
+            return bi === -1 ? null : baseXirr[bi];
+          });
+          datasets.push({
+            label: 'XIRR (No Withdrawal)',
+            data: vXirrGhost.map(v => v === null ? null : v * 100),
+            borderColor: GHOST_LINE_COLOR, backgroundColor: GHOST_LINE_COLOR,
+            borderWidth: 1.6, pointRadius: 0, tension: .15, fill: false, spanGaps: true, isGhostRef: true
+          });
+        }
+      }
+    }
+    datasets.push({
+      label: (showPrepay && xirrArrPrepay) ? 'แบบจ่ายทีละปี (ปกติ)' : 'XIRR (% p.a.)',
       data: xirrPct,
       borderColor: '#0b3d91', backgroundColor: '#0b3d91',
-      borderWidth: 2.5, pointRadius: 3, tension: .15, fill: false, spanGaps: true
-    }];
-    if (vXirrPrepay){
+      borderWidth: 2.5, pointRadius: 3, tension: .15, fill: false, spanGaps: true, isXirrNormal: true
+    });
+    if (showPrepay && vXirrPrepay){
       datasets.push({
         label: 'แบบ Prepayment',
         data: vXirrPrepay.map(v => v === null ? null : v * 100),
         borderColor: '#1f7a4d', backgroundColor: '#1f7a4d',
-        borderWidth: 2.5, pointRadius: 3, tension: .15, fill: false, spanGaps: true, borderDash: [6,3]
+        borderWidth: 2.5, pointRadius: 3, tension: .15, fill: false, spanGaps: true, borderDash: [6,3], isXirrPrepay: true
       });
     }
-    // ~20% headroom above the highest point so the mid-positioned tooltip / top markers have room
-    const allVals = xirrPct.concat(vXirrPrepay ? vXirrPrepay.map(v=>v===null?null:v*100) : []).filter(v => v !== null && v !== undefined);
+    const ghostPct = vXirrGhost ? vXirrGhost.map(v => v === null ? null : v * 100) : [];
+    const allVals = xirrPct.concat(showPrepay && vXirrPrepay ? vXirrPrepay.map(v=>v===null?null:v*100) : []).concat(ghostPct).filter(v => v !== null && v !== undefined);
     const dataMax = allVals.length ? Math.max(...allVals) : null;
     const dataMin = allVals.length ? Math.min(...allVals) : null;
     let yMax;
@@ -1636,7 +2739,7 @@ function renderXirrView(){
           y:{ max: yMax, ticks:{ font:{size:12.5*fs,family:"'Inter','Kanit',sans-serif"}, callback:(v)=> v.toFixed(1)+'%' }, grid:{color:'#eee'} }
         },
         plugins:{
-          legend:{ display: !!vXirrPrepay, position:'top', labels:{ boxWidth:16, font:{size:11.5*fs,family:"'Kanit','Inter',sans-serif"} } },
+          legend:{ display: datasets.length > 1, position:'top', labels:{ boxWidth:16, font:{size:11.5*fs,family:"'Kanit','Inter',sans-serif"} } },
           tooltip:{
             enabled:false,
             external: (context) => renderXirrTooltip(context, vYears, vAges)
@@ -1646,7 +2749,11 @@ function renderXirrView(){
       plugins: [crosshairPlugin, xirrBreakevenPlugin]
     });
     xirrChart._years = vYears;
-    xirrChart._breakevenInfo = { breakevenYear, gBreakYear: gBreak ? gBreak.year : null, breakevenYearPrepay, gBreakYearPrepay: gBreakPrepay ? gBreakPrepay.year : null };
+    xirrChart._breakevenInfo = {
+      breakevenYear, gBreakYear: gBreak ? gBreak.year : null,
+      breakevenYearPrepay: showPrepay ? breakevenYearPrepay : null,
+      gBreakYearPrepay: showPrepay && gBreakPrepay ? gBreakPrepay.year : null
+    };
   } catch (chartErr){
     console.error('XIRR chart render error:', chartErr);
   }
@@ -1655,9 +2762,11 @@ function renderXirrView(){
   const tableEl = document.getElementById('xirrTable');
   const isPar = product.type === 'par';
   let headHtml = '<thead><tr><th>ปี</th><th>อายุ</th><th>เบี้ยสะสม</th>';
+  const hasWdCols = !!(cashWithdrawal || cumulativeWithdrawal);
+  if (hasWdCols) headHtml += '<th>ถอนปีนี้</th><th>ถอนสะสม</th>';
   if (isPar) headHtml += '<th>Guaranteed</th><th>Non-Guar.</th>';
   headHtml += `<th>${isPar ? 'Total SV' : 'Surrender Value'}</th><th>XIRR (ปกติ)</th>`;
-  if (xirrArrPrepay) headHtml += '<th>XIRR (Prepayment)</th>';
+  if (showPrepay) headHtml += '<th>XIRR (Prepayment)</th>';
   headHtml += '</tr></thead>';
   let bodyHtml = '<tbody>';
   years.forEach((y, i) => {
@@ -1678,13 +2787,19 @@ function renderXirrView(){
     bodyHtml += `<td${rowClass}>Y${y}</td>`;
     bodyHtml += `<td${rowClass}>${age!==null&&age!==undefined?age:'—'}</td>`;
     bodyHtml += `<td${rowClass}>${prem!==null&&prem!==undefined?formatMoneyTable(prem*mult):'—'}</td>`;
+    if (hasWdCols){
+      const w = cashWithdrawal ? cashWithdrawal[i] : null;
+      const cw = cumulativeWithdrawal ? cumulativeWithdrawal[i] : null;
+      bodyHtml += `<td${rowClass}>${w!==null&&w!==undefined?formatMoneyTable(w*mult):'—'}</td>`;
+      bodyHtml += `<td${rowClass}>${cw!==null&&cw!==undefined?formatMoneyTable(cw*mult):'—'}</td>`;
+    }
     if (isPar){
       bodyHtml += `<td${rowClass}>${g!==null&&g!==undefined?formatMoneyTable(g*mult):'—'}</td>`;
       bodyHtml += `<td${rowClass}>${ng!==null&&ng!==undefined?formatMoneyTable(ng*mult):'—'}</td>`;
     }
     bodyHtml += `<td${rowClass}>${tot!==null&&tot!==undefined?formatMoneyTable(tot*mult):'—'}</td>`;
     bodyHtml += `<td${rowClass} class="${xirrCls}">${xv===null?'—':(xv*100).toFixed(2)+'%'}</td>`;
-    if (xirrArrPrepay){
+    if (showPrepay){
       const xvP = xirrArrPrepay[i];
       const isBreakevenP = breakevenYearPrepay !== null && y === breakevenYearPrepay;
       const isGBreakevenP = gBreakPrepay !== null && y === gBreakPrepay.year;
@@ -1695,9 +2810,10 @@ function renderXirrView(){
   });
   bodyHtml += '</tbody>';
   tableEl.innerHTML = headHtml + bodyHtml;
-  let subTxt = `${product.label} · Cash Breakeven ปีที่ ${breakevenYear !== null ? breakevenYear : '—'}` +
+  let subTxt = `${product.label}${product.scenario === 'withdrawal' ? ' · Withdrawal' : ''}` +
+    ` · Cash Breakeven ปีที่ ${breakevenYear !== null ? breakevenYear : '—'}` +
     (gBreak ? ` · Guaranteed Breakeven ปีที่ ${gBreak.year}` : '');
-  if (xirrArrPrepay){
+  if (showPrepay){
     subTxt += ` | Prepayment: Cash Breakeven ปีที่ ${breakevenYearPrepay !== null ? breakevenYearPrepay : '—'}` +
       (gBreakPrepay ? ` · Guaranteed Breakeven ปีที่ ${gBreakPrepay.year}` : '');
   }
@@ -1724,6 +2840,7 @@ async function handleFile(slot, file){
       nameEl.textContent = `สินค้าที่ ${slot}: ไม่พบตาราง SV/DB ในเอกสารนี้`;
       nameEl.title = file.name + ' — ลองตรวจสอบว่าเอกสารมีตาราง Summary Illustration แบบมาตรฐาน';
       state.products['p' + slot] = null;
+      state.scenario['p' + slot] = 'base';
       finalizeProductLabel(slot, null);
       render();
       return;
@@ -1732,7 +2849,13 @@ async function handleFile(slot, file){
     const cleanPlanName = (parsed.meta.planName && parsed.meta.planName.length <= 90) ? parsed.meta.planName : null;
     const rawLabel = cleanPlanName || file.name.replace(/\.docx$/i,'');
     const label = shortenProductName(rawLabel) || rawLabel;
-    state.products['p' + slot] = { label, type: parsed.type, sv: parsed.sv, db: parsed.db, prepayment: parsed.prepayment };
+    state.products['p' + slot] = {
+      label, type: parsed.type, sv: parsed.sv, db: parsed.db, prepayment: parsed.prepayment,
+      svWithdrawal: parsed.svWithdrawal || null, dbWithdrawal: parsed.dbWithdrawal || null,
+      dualBasis: !!parsed.dualBasis,
+      assumedCreditingRate: parsed.assumedCreditingRate || null
+    };
+    state.scenario['p' + slot] = 'base';
 
     cardEl.className = 'upload-card-compact slot' + slot + ' ok';
     nameEl.textContent = `สินค้าที่ ${slot}: ${label} ✓`;
@@ -1741,6 +2864,8 @@ async function handleFile(slot, file){
     bits.push('ประเภท: ' + (parsed.type === 'par' ? 'Guaranteed/Non-Guaranteed (PAR)' : 'Account/Surrender/Death Benefit (UL)'));
     const nPts = (parsed.sv ? parsed.sv.years.length : 0) || (parsed.db ? parsed.db.years.length : 0);
     bits.push('จุดข้อมูล: ' + nPts + ' ปี');
+    if (parsed.dualBasis) bits.push('2 ฐาน: Guaranteed / Current Assumed');
+    if (parsed.svWithdrawal || parsed.dbWithdrawal) bits.push('มีตาราง Withdrawal');
     nameEl.title = bits.join(' · ');
 
     finalizeProductLabel(slot, label);
@@ -1756,6 +2881,7 @@ async function handleFile(slot, file){
     nameEl.textContent = `สินค้าที่ ${slot}: อ่านไฟล์ไม่สำเร็จ`;
     nameEl.title = 'เกิดข้อผิดพลาด: ' + (err && err.message ? err.message : 'unknown error');
     state.products['p' + slot] = null;
+    state.scenario['p' + slot] = 'base';
     finalizeProductLabel(slot, null);
     try { render(); } catch (e2){ console.error('Chart render error:', e2); }
   }
@@ -1811,6 +2937,14 @@ function wireSeg(segId, attr, onChange){
 }
 wireSeg('viewModeSeg', 'data-view', (val) => { state.viewMode = val; render(); });
 wireSeg('metricSeg', 'data-metric', (val) => { state.metric = val; state.hidden.clear(); render(); });
+wireSeg('scenarioSeg', 'data-scenario', (val) => {
+  relevantProductKeys().forEach(pk => {
+    if (productHasWithdrawal(state.products[pk])) state.scenario[pk] = val;
+  });
+  state.hidden.clear();
+  render();
+});
+wireSeg('prepaySeg', 'data-prepay', (val) => { state.showPrepay = (val === 'on'); render(); });
 wireSeg('productSeg', 'data-product', (val) => { state.product = val; state.hidden.clear(); render(); });
 wireSeg('xirrProductSeg', 'data-xirrproduct', (val) => { state.xirrProduct = val; render(); });
 wireSeg('rangeSeg', 'data-range', (val) => { state.xAxisRange = (val === 'all') ? Infinity : parseInt(val, 10); render(); });
@@ -1835,5 +2969,62 @@ fontSeg.querySelectorAll('.fs-btn').forEach(btn => {
     render();
   });
 });
+
+(function wireGlossary(){
+  const overlay = document.getElementById('glossaryOverlay');
+  const openBtn = document.getElementById('glossaryBtn');
+  const closeBtn = document.getElementById('glossaryClose');
+  const modal = overlay && overlay.querySelector('.glossary-modal');
+  if (!overlay || !openBtn || !closeBtn) return;
+
+  function openGlossary(){
+    overlay.hidden = false;
+    openBtn.setAttribute('aria-expanded', 'true');
+    closeBtn.focus();
+  }
+  function closeGlossary(){
+    if (overlay.hidden) return;
+    overlay.hidden = true;
+    openBtn.setAttribute('aria-expanded', 'false');
+    openBtn.focus();
+  }
+
+  openBtn.addEventListener('click', openGlossary);
+  closeBtn.addEventListener('click', closeGlossary);
+  overlay.addEventListener('click', (e) => { if (e.target === overlay) closeGlossary(); });
+  if (modal) modal.addEventListener('click', (e) => e.stopPropagation());
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape'){
+      if (!overlay.hidden){ e.preventDefault(); closeGlossary(); return; }
+      document.querySelectorAll('.info-btn.is-open').forEach(btn => {
+        btn.classList.remove('is-open');
+        btn.setAttribute('aria-expanded', 'false');
+      });
+    }
+  });
+})();
+
+(function wireInfoTips(){
+  document.querySelectorAll('.info-btn').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const wasOpen = btn.classList.contains('is-open');
+      document.querySelectorAll('.info-btn.is-open').forEach(other => {
+        other.classList.remove('is-open');
+        other.setAttribute('aria-expanded', 'false');
+      });
+      if (!wasOpen){
+        btn.classList.add('is-open');
+        btn.setAttribute('aria-expanded', 'true');
+      }
+    });
+  });
+  document.addEventListener('click', () => {
+    document.querySelectorAll('.info-btn.is-open').forEach(btn => {
+      btn.classList.remove('is-open');
+      btn.setAttribute('aria-expanded', 'false');
+    });
+  });
+})();
 
 render();
