@@ -559,7 +559,7 @@ function extractPrepaymentInfo(docEl, rawText){
   // Priority 3 (fallback): Chubb-style wording — year 1 is paid normally, and a separate
   // deposit fund prepays only the remaining years, so the two must be added together.
   const found = findLabeledValueInTables(docEl, {
-    year1Payment: /total initial annual premium and insurance levy/i,
+    year1Payment: /total initial annual premium(?:\s+and\s+insurance\s+levy)?\s+of\s+your\s+policy\b/i,
     prepaidAmount: /total prepaid amount/i
   });
   if (found.year1Payment !== undefined && found.prepaidAmount !== undefined &&
