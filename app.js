@@ -1501,10 +1501,11 @@ const PALETTE = {
         accountValue:'#0b3d91', surrenderValue:'#3d78c9', deathBenefit:'#7fb3e0' }
 };
 /* Dual-basis UL lines: split Guaranteed vs Current Assumed by hue (not dash).
-   Dash is reserved for Prepayment vs annual pay. */
+   Dash is reserved for Prepayment vs annual pay. P1 is navy/gold; P2 is a
+   separate purple/teal family so two products stay distinguishable. */
 const DUAL_BASIS_LINE = {
   p1: { guaranteed:'#2c5f8a', conservative:'#2c5f8a', assumed:'#c8962c' },
-  p2: { guaranteed:'#4a8bb5', conservative:'#4a8bb5', assumed:'#d4a24a' }
+  p2: { guaranteed:'#6b46c1', conservative:'#6b46c1', assumed:'#0d9488' }
 };
 function dualLowKindOf(p){
   if (!p) return null;
@@ -2238,6 +2239,23 @@ function applyInterpolatedGhostDefaultHidden(){
     }
   });
 }
+function isComparisonRefLine(cfg){
+  if (!cfg) return false;
+  if (cfg.isPremiumRef || cfg.isAvRef) return true;
+  return /_sv_av$/.test(cfg.id);
+}
+/* Account Value + Total Premium Paid (+ Prepayment) are useful in single-product
+   view but crowd a two-product comparison. Default-hide them only while both
+   products are on the chart; a legend click still wins via legendTouched. */
+function applyComparisonRefDefaultHidden(){
+  const twoActive = relevantProductKeys().length >= 2;
+  (datasetConfigs || []).forEach(cfg => {
+    if (!isComparisonRefLine(cfg)) return;
+    if (state.legendTouched && state.legendTouched.has(cfg.id)) return;
+    if (twoActive) state.hidden.add(cfg.id);
+    else state.hidden.delete(cfg.id);
+  });
+}
 
 function buildDatasetConfigs(){
   datasetConfigs = [];
@@ -2347,8 +2365,8 @@ function buildDatasetConfigs(){
       } else if (p.sv){
         if (p.sv.accountValue && p.sv.accountValue.some(v=>v!==null)){
           const av = alignToYears(years, p.sv.years, p.sv.ages, p.sv.accountValue);
-          datasetConfigs.push({ id: pk+'_sv_av', metric:'sv', product:pk, type:'line', stack: pk+'_sv_av',
-            label: seriesLabel(pk, 'Account Value'), rawData: interpolateNulls(av), borderColor:pal.accountValue, backgroundColor:pal.accountValue,
+          datasetConfigs.push({ id: pk+'_sv_av', metric:'sv', product:pk, type:'line', stack: pk+'_sv_av', isAvRef:true,
+            label: seriesLabel(pk, 'Account Value'), rawData: interpolateNulls(av), borderColor:pal.accountValue, backgroundColor:pal.accountValue, legendColor: pal.accountValue,
             borderWidth:2.5, pointRadius:3, tension:.15, order:0, fill:false });
         }
         if (p.sv.surrenderValue && p.sv.surrenderValue.some(v=>v!==null)){
@@ -2735,6 +2753,7 @@ function renderCompareView(){
 
   const { years, ages } = buildDatasetConfigs();
   applyInterpolatedGhostDefaultHidden();
+  applyComparisonRefDefaultHidden();
   if (!years || years.length === 0){
     document.getElementById('emptyState').style.display = 'flex';
     document.getElementById('chartStack').style.display = 'none';
